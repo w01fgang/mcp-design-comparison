@@ -19,8 +19,17 @@
     "screenshot",
     "pixelmatch"
   ],
-  "author": "",
+  "author": "wolf",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/w01fgang/mcp-design-comparison.git"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "AGENTS.md"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "pixelmatch": "^7.0.0",
@@ -29,6 +38,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/pixelmatch": "^5.2.6",
+    "@types/pngjs": "^6.0.5",
     "typescript": "^5.7.0"
   }
 }

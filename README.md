@@ -12,7 +12,25 @@ An MCP (Model Context Protocol) server that allows LLMs to compare design screen
 
 ## Installation
 
+### For End Users
+
+Install globally via npm:
+
 ```bash
+npm install -g mcp-design-comparison
+```
+
+Or using npx (no installation required):
+
+```bash
+npx mcp-design-comparison
+```
+
+### For Development
+
+```bash
+git clone https://github.com/w01fgang/mcp-design-comparison.git
+cd mcp-design-comparison
 npm install
 npm run build
 ```
@@ -41,18 +59,35 @@ Compare a design screenshot with an implementation screenshot.
 
 ### Configuration Example
 
-Add to your MCP settings file (e.g., Claude Desktop config):
+Add to your MCP settings file:
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
 
 ```json
 {
   "mcpServers": {
     "design-comparison": {
-      "command": "node",
-      "args": ["/path/to/mcp-design-comparison/dist/index.js"]
+      "command": "npx",
+      "args": ["-y", "mcp-design-comparison"]
     }
   }
 }
 ```
+
+**Cursor** (`~/Library/Application Support/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` on macOS):
+
+```json
+{
+  "mcpServers": {
+    "design-comparison": {
+      "command": "npx",
+      "args": ["-y", "mcp-design-comparison"]
+    }
+  }
+}
+```
+
+After adding the configuration, restart Claude Desktop or Cursor.
 
 ## How It Works
 
