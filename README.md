@@ -1,10 +1,11 @@
 # MCP Design Comparison Server
 
-An MCP (Model Context Protocol) server that allows LLMs to compare design screenshots with implementation screenshots using [pixelmatch](https://github.com/mapbox/pixelmatch). This tool helps identify visual discrepancies between design mockups and actual implementation.
+An MCP (Model Context Protocol) server that allows LLMs to compare design screenshots with implementation screenshots using [pixelmatch](https://github.com/mapbox/pixelmatch). Supports multiple image formats including PNG, JPEG, WebP, GIF, and TIFF. This tool helps identify visual discrepancies between design mockups and actual implementation.
 
 ## Features
 
-- **Screenshot Comparison**: Compare two PNG images pixel-by-pixel
+- **Multi-Format Support**: Works with PNG, JPEG, WebP, GIF, and TIFF images
+- **Screenshot Comparison**: Compare two images pixel-by-pixel
 - **Visual Diff Output**: Generate a highlighted diff image showing differences
 - **Detailed Metrics**: Get total pixels, different pixels, and percentage difference
 - **Configurable Threshold**: Adjust sensitivity of the comparison
@@ -46,9 +47,9 @@ Add this server to your MCP client configuration. The server runs on stdio and p
 Compare a design screenshot with an implementation screenshot.
 
 **Parameters:**
-- `design_path` (string, required): Path to the design screenshot (PNG format)
-- `implementation_path` (string, required): Path to the implementation screenshot (PNG format)
-- `output_diff_path` (string, optional): Path to save the diff image. If not provided, the diff image will be returned as base64
+- `design_path` (string, required): Path to the design screenshot (supports PNG, JPEG, WebP, GIF, TIFF)
+- `implementation_path` (string, required): Path to the implementation screenshot (supports PNG, JPEG, WebP, GIF, TIFF)
+- `output_diff_path` (string, optional): Path to save the diff image (always saved as PNG). If not provided, the diff image will be returned as base64
 - `threshold` (number, optional): Matching threshold (0-1). Smaller values make the comparison more sensitive. Default is 0.1
 
 **Returns:**
@@ -123,7 +124,7 @@ node test-manual.mjs design.png implementation.png [output-diff.png]
 ## Requirements
 
 - Node.js 18+
-- PNG images with matching dimensions
+- Images with matching dimensions (PNG, JPEG, WebP, GIF, or TIFF)
 
 ## License
 

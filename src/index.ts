@@ -9,6 +9,7 @@ import {
 import fs from "fs/promises";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
+import sharp from "sharp";
 
 interface CompareResult {
   totalPixels: number;
@@ -22,18 +23,24 @@ export async function loadPNG(filePath: string): Promise<PNG> {
     // Check if file exists
     await fs.access(filePath);
     
-    const data = await fs.readFile(filePath);
+    // Use sharp to convert any image format to PNG buffer
+    // This handles PNG, JPEG, WebP, GIF, TIFF, etc.
+    const { data, info } = await sharp(filePath)
+      .ensureAlpha() // Ensure RGBA format
+      .raw()
+      .toBuffer({ resolveWithObject: true });
     
-    // Validate PNG signature (first 8 bytes)
-    const pngSignature = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-    if (data.length < 8 || !data.subarray(0, 8).equals(pngSignature)) {
-      throw new Error(`File is not a valid PNG image: ${filePath}`);
-    }
+    // Create PNG object from raw pixel data
+    const png = new PNG({ width: info.width, height: info.height });
+    png.data = data;
     
-    return PNG.sync.read(data);
+    return png;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       throw new Error(`File not found: ${filePath}`);
+    }
+    if ((error as Error).message.includes('Input buffer') || (error as Error).message.includes('unsupported')) {
+      throw new Error(`Unsupported image format: ${filePath}`);
     }
     throw error;
   }
@@ -113,17 +120,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "compare_design",
         description:
-          "Compare a design screenshot with an implementation screenshot using pixelmatch. Returns the number and percentage of different pixels, and optionally outputs a diff image highlighting the differences.",
+          "Compare a design screenshot with an implementation screenshot using pixelmatch. Supports PNG, JPEG, WebP, GIF, and TIFF formats. Returns the number and percentage of different pixels, and optionally outputs a diff image highlighting the differences.",
         inputSchema: {
           type: "object",
           properties: {
             design_path: {
               type: "string",
-              description: "Path to the design screenshot (PNG format)",
+              description: "Path to the design screenshot (supports PNG, JPEG, WebP, GIF, TIFF)",
             },
             implementation_path: {
               type: "string",
-              description: "Path to the implementation screenshot (PNG format)",
+              description: "Path to the implementation screenshot (supports PNG, JPEG, WebP, GIF, TIFF)",
             },
             output_diff_path: {
               type: "string",

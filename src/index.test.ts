@@ -39,17 +39,17 @@ describe("PNG loading and validation", () => {
     );
   });
 
-  test("should reject non-PNG files", async () => {
+  test("should reject unsupported image files", async () => {
     const { loadPNG } = await import("./index.js");
-    const notAPng = path.join(__dirname, "../test-fixtures/not-a-png.txt");
-    await fs.writeFile(notAPng, "This is not a PNG file");
+    const notAnImage = path.join(__dirname, "../test-fixtures/not-an-image.txt");
+    await fs.writeFile(notAnImage, "This is not an image file");
 
     await assert.rejects(
-      async () => await loadPNG(notAPng),
-      /not a valid PNG image/
+      async () => await loadPNG(notAnImage),
+      /Unsupported image format/
     );
 
-    await fs.unlink(notAPng);
+    await fs.unlink(notAnImage);
   });
 
   test("should load valid PNG files", async () => {

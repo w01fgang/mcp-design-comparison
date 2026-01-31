@@ -4,7 +4,7 @@ This file provides guidance to WARP (warp.dev) when working with code in this re
 
 ## Project Overview
 
-This is an MCP (Model Context Protocol) server that exposes a single tool (`compare_design`) for comparing design screenshots with implementation screenshots using pixelmatch. The server communicates via stdio and is intended to be used by MCP clients like Claude Desktop.
+This is an MCP (Model Context Protocol) server that exposes a single tool (`compare_design`) for comparing design screenshots with implementation screenshots using pixelmatch. Supports PNG, JPEG, WebP, GIF, and TIFF image formats. The server communicates via stdio and is intended to be used by MCP clients like Claude Desktop.
 
 ## Development Commands
 
@@ -26,7 +26,7 @@ npm run watch
 The entire server is implemented in one file with three main components:
 
 1. **Image Processing Functions**:
-   - `loadPNG()`: Reads PNG files using pngjs
+   - `loadPNG()`: Loads images in multiple formats (PNG, JPEG, WebP, GIF, TIFF) using sharp, converts to raw pixel data
    - `compareScreenshots()`: Core comparison logic using pixelmatch, returns metrics and diff image
 
 2. **MCP Server Setup**: 
@@ -40,11 +40,12 @@ The entire server is implemented in one file with three main components:
 
 ### Key Constraints
 
-- Only PNG format is supported (via pngjs library)
+- Supports PNG, JPEG, WebP, GIF, and TIFF formats (via sharp library)
 - Images must have identical dimensions
 - Server runs on stdio (not HTTP) - designed for local MCP client communication
 - Uses ES modules (`"type": "module"` in package.json)
 - TypeScript compilation uses `Node16` module resolution
+- Sharp library requires native binaries (automatically handled during npm install)
 
 ## Testing the Server
 
@@ -81,7 +82,7 @@ The server logs to stderr, so startup messages won't interfere with MCP stdio co
 
 The server validates:
 - File existence before attempting to read
-- PNG file signature (first 8 bytes) to ensure valid PNG format
+- Image format support (PNG, JPEG, WebP, GIF, TIFF)
 - Image dimensions match before comparison
 
-This prevents the "unrecognised content at end of stream" error from pngjs when invalid files are provided.
+Sharp automatically handles format detection and conversion, preventing format-related errors. JPEG files with .png extensions are automatically handled correctly.
