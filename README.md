@@ -104,6 +104,22 @@ After adding the configuration, restart Claude Desktop or Cursor.
 - **Cross-browser Testing**: Compare renders across different browsers
 - **Responsive Design**: Compare layouts at different breakpoints
 
+## Testing
+
+### Run Automated Tests
+
+```bash
+npm test
+```
+
+### Manual Testing with Your Screenshots
+
+Use the included test script:
+
+```bash
+node test-manual.mjs design.png implementation.png [output-diff.png]
+```
+
 ## Requirements
 
 - Node.js 18+

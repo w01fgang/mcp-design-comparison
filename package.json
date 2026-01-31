@@ -1,6 +1,6 @@
 {
   "name": "mcp-design-comparison",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for comparing design screenshots with implementation using pixelmatch",
   "type": "module",
   "main": "dist/index.js",
@@ -10,7 +10,9 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "test": "node --test dist/index.test.js",
+    "test:watch": "node --test --watch dist/index.test.js"
   },
   "keywords": [
     "mcp",
@@ -28,7 +30,8 @@
   "files": [
     "dist",
     "README.md",
-    "AGENTS.md"
+    "AGENTS.md",
+    "test-manual.mjs"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",

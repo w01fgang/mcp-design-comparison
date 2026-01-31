@@ -17,12 +17,29 @@ interface CompareResult {
   diffImageBase64?: string;
 }
 
-async function loadPNG(filePath: string): Promise<PNG> {
-  const data = await fs.readFile(filePath);
-  return PNG.sync.read(data);
+export async function loadPNG(filePath: string): Promise<PNG> {
+  try {
+    // Check if file exists
+    await fs.access(filePath);
+    
+    const data = await fs.readFile(filePath);
+    
+    // Validate PNG signature (first 8 bytes)
+    const pngSignature = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    if (data.length < 8 || !data.subarray(0, 8).equals(pngSignature)) {
+      throw new Error(`File is not a valid PNG image: ${filePath}`);
+    }
+    
+    return PNG.sync.read(data);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(`File not found: ${filePath}`);
+    }
+    throw error;
+  }
 }
 
-async function compareScreenshots(
+export async function compareScreenshots(
   designPath: string,
   implementationPath: string,
   outputDiffPath?: string,

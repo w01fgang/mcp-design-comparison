@@ -48,10 +48,40 @@ The entire server is implemented in one file with three main components:
 
 ## Testing the Server
 
-There is no test framework yet. To test manually:
+### Automated Tests
+
+The project includes comprehensive tests using Node.js's built-in test runner:
+
+```bash
+npm test
+```
+
+Tests cover:
+- File validation (existence, PNG format)
+- Image comparison (identical, different, dimension mismatch)
+- Output modes (file save, base64)
+
+### Manual Testing
+
+Use the included test script to test with real screenshots:
+
+```bash
+node test-manual.mjs design.png implementation.png [output-diff.png]
+```
+
+### MCP Client Testing
 
 1. Build the project: `npm run build`
 2. Configure an MCP client (e.g., Claude Desktop) to point to `dist/index.js`
 3. Use the `compare_design` tool with two PNG screenshots
 
 The server logs to stderr, so startup messages won't interfere with MCP stdio communication.
+
+## Error Handling
+
+The server validates:
+- File existence before attempting to read
+- PNG file signature (first 8 bytes) to ensure valid PNG format
+- Image dimensions match before comparison
+
+This prevents the "unrecognised content at end of stream" error from pngjs when invalid files are provided.
