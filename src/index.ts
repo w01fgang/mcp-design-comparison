@@ -10,6 +10,7 @@ import fs from "fs/promises";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 import sharp from "sharp";
+import { pathToFileURL } from "url";
 
 interface CompareResult {
   totalPixels: number;
@@ -113,8 +114,7 @@ const server = new Server(
   }
 );
 
-// List available tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+export async function handleListToolsRequest() {
   return {
     tools: [
       {
@@ -149,22 +149,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
     ],
   };
-});
+}
 
-// Handle tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+interface CallToolRequest {
+  params: {
+    name: string;
+    arguments?: Record<string, unknown>;
+  };
+}
+
+export async function handleCallToolRequest(request: CallToolRequest) {
   if (request.params.name === "compare_design") {
+    const args = (request.params.arguments ?? {}) as {
+      design_path?: string;
+      implementation_path?: string;
+      output_diff_path?: string;
+      threshold?: number;
+    };
     const {
       design_path,
       implementation_path,
       output_diff_path,
       threshold = 0.1,
-    } = request.params.arguments as {
-      design_path: string;
-      implementation_path: string;
-      output_diff_path?: string;
-      threshold?: number;
-    };
+    } = args;
+    if (typeof design_path !== "string" || typeof implementation_path !== "string") {
+      throw new Error("design_path and implementation_path are required");
+    }
 
     try {
       const result = await compareScreenshots(
@@ -216,7 +226,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   throw new Error(`Unknown tool: ${request.params.name}`);
-});
+}
+
+// List available tools
+server.setRequestHandler(ListToolsRequestSchema, handleListToolsRequest);
+
+// Handle tool calls
+server.setRequestHandler(CallToolRequestSchema, handleCallToolRequest);
 
 // Start the server
 async function main() {
@@ -225,7 +241,10 @@ async function main() {
   console.error("MCP Design Comparison Server running on stdio");
 }
 
-main().catch((error) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
-});
+const entryPoint = process.argv[1];
+if (entryPoint && import.meta.url === pathToFileURL(entryPoint).href) {
+  main().catch((error) => {
+    console.error("Fatal error:", error);
+    process.exit(1);
+  });
+}

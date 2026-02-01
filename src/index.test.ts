@@ -4,6 +4,7 @@ import fs from "fs/promises";
 import { PNG } from "pngjs";
 import path from "path";
 import { fileURLToPath } from "url";
+import sharp from "sharp";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,6 +16,7 @@ async function createTestPNG(
   color: { r: number; g: number; b: number; a: number },
   filePath: string
 ): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
   const png = new PNG({ width, height });
 
   for (let y = 0; y < height; y++) {
@@ -30,6 +32,26 @@ async function createTestPNG(
   await fs.writeFile(filePath, PNG.sync.write(png));
 }
 
+async function createTestJPEG(
+  width: number,
+  height: number,
+  color: { r: number; g: number; b: number },
+  filePath: string
+): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const buffer = await sharp({
+    create: {
+      width,
+      height,
+      channels: 3,
+      background: color,
+    },
+  })
+    .jpeg()
+    .toBuffer();
+  await fs.writeFile(filePath, buffer);
+}
+
 describe("PNG loading and validation", () => {
   test("should reject non-existent files", async () => {
     const { loadPNG } = await import("./index.js");
@@ -42,6 +64,7 @@ describe("PNG loading and validation", () => {
   test("should reject unsupported image files", async () => {
     const { loadPNG } = await import("./index.js");
     const notAnImage = path.join(__dirname, "../test-fixtures/not-an-image.txt");
+    await fs.mkdir(path.dirname(notAnImage), { recursive: true });
     await fs.writeFile(notAnImage, "This is not an image file");
 
     await assert.rejects(
@@ -62,6 +85,18 @@ describe("PNG loading and validation", () => {
     assert.strictEqual(png.height, 10);
 
     await fs.unlink(testPng);
+  });
+
+  test("should load valid JPEG files", async () => {
+    const { loadPNG } = await import("./index.js");
+    const testJpeg = path.join(__dirname, "../test-fixtures/test.jpg");
+    await createTestJPEG(12, 8, { r: 10, g: 20, b: 30 }, testJpeg);
+
+    const image = await loadPNG(testJpeg);
+    assert.strictEqual(image.width, 12);
+    assert.strictEqual(image.height, 8);
+
+    await fs.unlink(testJpeg);
   });
 });
 
@@ -153,5 +188,57 @@ describe("Screenshot comparison", () => {
 
     await fs.unlink(img1);
     await fs.unlink(img2);
+  });
+});
+
+describe("MCP request handling", () => {
+  test("should list compare_design tool", async () => {
+    const { handleListToolsRequest } = await import("./index.js");
+    const result = await handleListToolsRequest();
+    assert.ok(Array.isArray(result.tools));
+    const toolNames = result.tools.map((tool) => tool.name);
+    assert.ok(toolNames.includes("compare_design"));
+  });
+
+  test("should return image content when no output path provided", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const img1 = path.join(__dirname, "../test-fixtures/handler-1.png");
+    const img2 = path.join(__dirname, "../test-fixtures/handler-2.png");
+
+    await createTestPNG(8, 8, { r: 120, g: 120, b: 120, a: 255 }, img1);
+    await createTestPNG(8, 8, { r: 120, g: 120, b: 120, a: 255 }, img2);
+
+    const response = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: img1,
+          implementation_path: img2,
+        },
+      },
+    });
+
+    assert.ok(Array.isArray(response.content));
+    const hasImage = response.content.some((item) => item.type === "image");
+    assert.ok(hasImage);
+
+    await fs.unlink(img1);
+    await fs.unlink(img2);
+  });
+
+  test("should return error content on compare failure", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const response = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: "/non/existent/design.png",
+          implementation_path: "/non/existent/implementation.png",
+        },
+      },
+    });
+
+    assert.strictEqual(response.isError, true);
+    assert.ok(response.content[0].text.startsWith("Error comparing screenshots"));
   });
 });
