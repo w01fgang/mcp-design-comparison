@@ -241,4 +241,66 @@ describe("MCP request handling", () => {
     assert.strictEqual(response.isError, true);
     assert.ok(response.content[0].text.startsWith("Error comparing screenshots"));
   });
+
+  test("should accept numeric threshold and succeed", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const img1 = path.join(__dirname, "../test-fixtures/thresh-num-1.png");
+    const img2 = path.join(__dirname, "../test-fixtures/thresh-num-2.png");
+
+    await createTestPNG(6, 6, { r: 50, g: 50, b: 50, a: 255 }, img1);
+    await createTestPNG(6, 6, { r: 200, g: 50, b: 50, a: 255 }, img2);
+
+    const response = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: img1,
+          implementation_path: img2,
+          threshold: 0,
+        },
+      },
+    });
+
+    assert.strictEqual(response.isError, undefined);
+    assert.ok(Array.isArray(response.content));
+    const textItem = response.content.find((c: any) => c.type === "text");
+    assert.ok(textItem);
+    assert.ok(textItem.text.includes("Difference:"));
+    // 0 threshold is sensitive; should report some >0 difference
+    assert.ok(/Difference: [1-9]/.test(textItem.text) || textItem.text.includes("100.00%") || textItem.text.includes("Difference: 100"));
+
+    await fs.unlink(img1);
+    await fs.unlink(img2);
+  });
+
+  test("should coerce invalid threshold (string) and still succeed using default", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const img1 = path.join(__dirname, "../test-fixtures/thresh-bad-1.png");
+    const img2 = path.join(__dirname, "../test-fixtures/thresh-bad-2.png");
+
+    await createTestPNG(6, 6, { r: 120, g: 120, b: 120, a: 255 }, img1);
+    await createTestPNG(6, 6, { r: 120, g: 121, b: 120, a: 255 }, img2);
+
+    const response = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: img1,
+          implementation_path: img2,
+          threshold: "not-a-number",
+        },
+      },
+    });
+
+    assert.strictEqual(response.isError, undefined);
+    assert.ok(Array.isArray(response.content));
+    const textItem = response.content.find((c: any) => c.type === "text");
+    assert.ok(textItem);
+    assert.ok(textItem.text.includes("Difference:"));
+    // invalid falls back to default 0.1; with tiny delta may be 0% or small, but must be finite valid %
+    assert.ok(/Difference: \d+\.\d+%/.test(textItem.text));
+
+    await fs.unlink(img1);
+    await fs.unlink(img2);
+  });
 });

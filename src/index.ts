@@ -12,6 +12,22 @@ import { PNG } from "pngjs";
 import sharp from "sharp";
 import { pathToFileURL } from "url";
 
+// Pure normalization for threshold: accepts number | string | other, coerces, clamps to [0,1], defaults to 0.1
+function normalizeThreshold(t: unknown): number {
+  let n: number;
+  if (typeof t === "number") {
+    n = t;
+  } else if (typeof t === "string") {
+    n = parseFloat(t);
+  } else {
+    n = NaN;
+  }
+  if (!Number.isFinite(n)) {
+    return 0.1;
+  }
+  return Math.max(0, Math.min(1, n));
+}
+
 interface CompareResult {
   totalPixels: number;
   differentPixels: number;
@@ -23,7 +39,15 @@ export async function loadPNG(filePath: string): Promise<PNG> {
   try {
     // Check if file exists
     await fs.access(filePath);
-    
+
+    // Probe metadata first (post-access) to detect unsupported formats robustly.
+    // Avoids fragile reliance on sharp raw/decode error message strings.
+    try {
+      await sharp(filePath).metadata();
+    } catch {
+      throw new Error(`Unsupported image format: ${filePath}`);
+    }
+
     // Use sharp to convert any image format to PNG buffer
     // This handles PNG, JPEG, WebP, GIF, TIFF, etc.
     const { data, info } = await sharp(filePath)
@@ -40,8 +64,8 @@ export async function loadPNG(filePath: string): Promise<PNG> {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       throw new Error(`File not found: ${filePath}`);
     }
-    if ((error as Error).message.includes('Input buffer') || (error as Error).message.includes('unsupported')) {
-      throw new Error(`Unsupported image format: ${filePath}`);
+    if (error instanceof Error && error.message.startsWith('Unsupported image format:')) {
+      throw error;
     }
     throw error;
   }
@@ -51,8 +75,9 @@ export async function compareScreenshots(
   designPath: string,
   implementationPath: string,
   outputDiffPath?: string,
-  threshold = 0.1
+  threshold: unknown = 0.1
 ): Promise<CompareResult> {
+  const normThreshold = normalizeThreshold(threshold);
   // Load both images
   const design = await loadPNG(designPath);
   const implementation = await loadPNG(implementationPath);
@@ -77,7 +102,7 @@ export async function compareScreenshots(
     diff.data,
     design.width,
     design.height,
-    { threshold }
+    { threshold: normThreshold }
   );
 
   const totalPixels = design.width * design.height;
@@ -105,7 +130,7 @@ export async function compareScreenshots(
 const server = new Server(
   {
     name: "mcp-design-comparison",
-    version: "0.1.0",
+    version: "0.3.0",
   },
   {
     capabilities: {
@@ -176,12 +201,14 @@ export async function handleCallToolRequest(request: CallToolRequest) {
       throw new Error("design_path and implementation_path are required");
     }
 
+    const normThreshold = normalizeThreshold(threshold);
+
     try {
       const result = await compareScreenshots(
         design_path,
         implementation_path,
         output_diff_path,
-        threshold
+        normThreshold
       );
 
       let responseText = `Design Comparison Results:\n\n`;
