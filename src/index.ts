@@ -173,6 +173,8 @@ export async function handleListToolsRequest() {
         },
       },
     ],
+    // version is reported via ListTools response (and server metadata) for direct inspection / MCP handshake
+    version: "0.3.0",
   };
 }
 

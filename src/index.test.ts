@@ -198,6 +198,8 @@ describe("MCP request handling", () => {
     assert.ok(Array.isArray(result.tools));
     const toolNames = result.tools.map((tool) => tool.name);
     assert.ok(toolNames.includes("compare_design"));
+    // version reported via ListTools (in addition to server metadata)
+    assert.strictEqual(result.version, "0.3.0");
   });
 
   test("should return image content when no output path provided", async () => {
