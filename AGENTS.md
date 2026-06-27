@@ -34,14 +34,14 @@ The entire server is implemented in one file with three main components:
    - Registers handlers for `ListToolsRequestSchema` and `CallToolRequestSchema`
 
 3. **Tool Implementation** (`compare_design`):
-   - Accepts two PNG paths, optional output path, and threshold (0-1)
+   - Accepts two PNG paths, optional output path, threshold (0-1), and `auto_resize` flag
    - Returns text response with statistics + optional base64 image or saves to file
-   - Validates matching image dimensions before comparison
+   - When dimensions differ, scales the implementation to the design's dimensions (or errors if `auto_resize` is `false`)
 
 ### Key Constraints
 
 - Supports PNG, JPEG, WebP, GIF, and TIFF formats (via sharp library)
-- Images must have identical dimensions
+- Differing dimensions are auto-resized by default (implementation → design); pass `auto_resize: false` to require identical dimensions
 - Server runs on stdio (not HTTP) - designed for local MCP client communication
 - Uses ES modules (`"type": "module"` in package.json)
 - TypeScript compilation uses `Node16` module resolution
@@ -83,6 +83,6 @@ The server logs to stderr, so startup messages won't interfere with MCP stdio co
 The server validates:
 - File existence before attempting to read
 - Image format support (PNG, JPEG, WebP, GIF, TIFF)
-- Image dimensions match before comparison
+- Image dimensions before comparison — reconciled via auto-resize, or rejected when `auto_resize` is `false`
 
 Sharp automatically handles format detection and conversion, preventing format-related errors. JPEG files with .png extensions are automatically handled correctly.

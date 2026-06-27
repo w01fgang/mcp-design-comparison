@@ -33,9 +33,18 @@ interface CompareResult {
   differentPixels: number;
   differencePercentage: number;
   diffImageBase64?: string;
+  resized?: {
+    fromWidth: number;
+    fromHeight: number;
+    toWidth: number;
+    toHeight: number;
+  };
 }
 
-export async function loadPNG(filePath: string): Promise<PNG> {
+export async function loadPNG(
+  filePath: string,
+  resizeTo?: { width: number; height: number }
+): Promise<PNG> {
   try {
     // Check if file exists
     await fs.access(filePath);
@@ -50,11 +59,16 @@ export async function loadPNG(filePath: string): Promise<PNG> {
 
     // Use sharp to convert any image format to PNG buffer
     // This handles PNG, JPEG, WebP, GIF, TIFF, etc.
-    const { data, info } = await sharp(filePath)
-      .ensureAlpha() // Ensure RGBA format
+    let pipeline = sharp(filePath).ensureAlpha(); // Ensure RGBA format
+    if (resizeTo) {
+      // fit: "fill" stretches to the exact target dimensions (ignoring aspect
+      // ratio) so the raw buffer lines up with the reference for pixelmatch.
+      pipeline = pipeline.resize(resizeTo.width, resizeTo.height, { fit: "fill" });
+    }
+    const { data, info } = await pipeline
       .raw()
       .toBuffer({ resolveWithObject: true });
-    
+
     // Create PNG object from raw pixel data
     const png = new PNG({ width: info.width, height: info.height });
     png.data = data;
@@ -75,21 +89,37 @@ export async function compareScreenshots(
   designPath: string,
   implementationPath: string,
   outputDiffPath?: string,
-  threshold: unknown = 0.1
+  threshold: unknown = 0.1,
+  autoResize: boolean = true
 ): Promise<CompareResult> {
   const normThreshold = normalizeThreshold(threshold);
   // Load both images
   const design = await loadPNG(designPath);
-  const implementation = await loadPNG(implementationPath);
+  let implementation = await loadPNG(implementationPath);
 
-  // Check if dimensions match
+  // Reconcile dimensions: pixelmatch requires identical buffers.
+  let resized: CompareResult["resized"];
   if (
     design.width !== implementation.width ||
     design.height !== implementation.height
   ) {
-    throw new Error(
-      `Image dimensions don't match: design (${design.width}x${design.height}) vs implementation (${implementation.width}x${implementation.height})`
-    );
+    if (!autoResize) {
+      throw new Error(
+        `Image dimensions don't match: design (${design.width}x${design.height}) vs implementation (${implementation.width}x${implementation.height})`
+      );
+    }
+    // Re-decode the implementation, stretched to the design's dimensions
+    // (the design is the reference) so the comparison can proceed.
+    resized = {
+      fromWidth: implementation.width,
+      fromHeight: implementation.height,
+      toWidth: design.width,
+      toHeight: design.height,
+    };
+    implementation = await loadPNG(implementationPath, {
+      width: design.width,
+      height: design.height,
+    });
   }
 
   // Create a diff image
@@ -114,6 +144,10 @@ export async function compareScreenshots(
     differencePercentage,
   };
 
+  if (resized) {
+    result.resized = resized;
+  }
+
   // Save or encode diff image
   if (outputDiffPath) {
     await fs.writeFile(outputDiffPath, PNG.sync.write(diff));
@@ -130,7 +164,7 @@ export async function compareScreenshots(
 const server = new Server(
   {
     name: "mcp-design-comparison",
-    version: "0.3.0",
+    version: "0.4.0",
   },
   {
     capabilities: {
@@ -168,13 +202,19 @@ export async function handleListToolsRequest() {
                 "Matching threshold (0-1). Smaller values make the comparison more sensitive. Default is 0.1.",
               default: 0.1,
             },
+            auto_resize: {
+              type: "boolean",
+              description:
+                "If true (default), the implementation screenshot is stretched to the design's dimensions when they differ, instead of failing. Set false to require identical dimensions.",
+              default: true,
+            },
           },
           required: ["design_path", "implementation_path"],
         },
       },
     ],
     // version is reported via ListTools response (and server metadata) for direct inspection / MCP handshake
-    version: "0.3.0",
+    version: "0.4.0",
   };
 }
 
@@ -192,12 +232,14 @@ export async function handleCallToolRequest(request: CallToolRequest) {
       implementation_path?: string;
       output_diff_path?: string;
       threshold?: number;
+      auto_resize?: boolean;
     };
     const {
       design_path,
       implementation_path,
       output_diff_path,
       threshold = 0.1,
+      auto_resize = true,
     } = args;
     if (typeof design_path !== "string" || typeof implementation_path !== "string") {
       throw new Error("design_path and implementation_path are required");
@@ -210,13 +252,18 @@ export async function handleCallToolRequest(request: CallToolRequest) {
         design_path,
         implementation_path,
         output_diff_path,
-        normThreshold
+        normThreshold,
+        auto_resize
       );
 
       let responseText = `Design Comparison Results:\n\n`;
       responseText += `Total Pixels: ${result.totalPixels.toLocaleString()}\n`;
       responseText += `Different Pixels: ${result.differentPixels.toLocaleString()}\n`;
       responseText += `Difference: ${result.differencePercentage.toFixed(2)}%\n`;
+
+      if (result.resized) {
+        responseText += `\nNote: implementation auto-resized from ${result.resized.fromWidth}x${result.resized.fromHeight} to ${result.resized.toWidth}x${result.resized.toHeight} to match the design.\n`;
+      }
 
       if (output_diff_path) {
         responseText += `\nDiff image saved to: ${output_diff_path}`;

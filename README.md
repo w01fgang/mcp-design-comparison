@@ -6,6 +6,7 @@ An MCP (Model Context Protocol) server that allows LLMs to compare design screen
 
 - **Multi-Format Support**: Works with PNG, JPEG, WebP, GIF, and TIFF images
 - **Screenshot Comparison**: Compare two images pixel-by-pixel
+- **Auto-Resize**: Mismatched resolutions are reconciled automatically — the implementation is scaled to the design's dimensions (toggle off with `auto_resize`)
 - **Visual Diff Output**: Generate a highlighted diff image showing differences
 - **Detailed Metrics**: Get total pixels, different pixels, and percentage difference
 - **Configurable Threshold**: Adjust sensitivity of the comparison
@@ -51,6 +52,7 @@ Compare a design screenshot with an implementation screenshot.
 - `implementation_path` (string, required): Path to the implementation screenshot (supports PNG, JPEG, WebP, GIF, TIFF)
 - `output_diff_path` (string, optional): Path to save the diff image (always saved as PNG). If not provided, the diff image will be returned as base64
 - `threshold` (number, optional): Matching threshold (0-1). Smaller values make the comparison more sensitive. Default is 0.1
+- `auto_resize` (boolean, optional): When the two screenshots differ in resolution, scale the implementation to the design's dimensions instead of erroring. Default is `true`. Set `false` to require identical dimensions.
 
 **Returns:**
 - Total number of pixels
@@ -92,8 +94,8 @@ After adding the configuration, restart Claude Desktop or Cursor.
 
 ## How It Works
 
-1. Loads both PNG images into memory
-2. Validates that dimensions match
+1. Loads both images into memory (any supported format → raw RGBA)
+2. If dimensions differ, scales the implementation to the design's dimensions (unless `auto_resize` is `false`, which errors instead)
 3. Uses pixelmatch to compare pixel-by-pixel
 4. Generates a diff image highlighting differences in pink
 5. Returns statistics and the diff image
@@ -124,7 +126,7 @@ node test-manual.mjs design.png implementation.png [output-diff.png]
 ## Requirements
 
 - Node.js 18+
-- Images with matching dimensions (PNG, JPEG, WebP, GIF, or TIFF)
+- Images in a supported format (PNG, JPEG, WebP, GIF, or TIFF); differing resolutions are auto-resized unless `auto_resize` is disabled
 
 ## License
 
