@@ -137,7 +137,7 @@ describe("Screenshot comparison", () => {
     await fs.unlink(img2);
   });
 
-  test("should reject images with different dimensions", async () => {
+  test("should reject mismatched dimensions when auto_resize is disabled", async () => {
     const { compareScreenshots } = await import("./index.js");
     const img1 = path.join(__dirname, "../test-fixtures/size1.png");
     const img2 = path.join(__dirname, "../test-fixtures/size2.png");
@@ -146,12 +146,39 @@ describe("Screenshot comparison", () => {
     await createTestPNG(20, 20, { r: 0, g: 0, b: 255, a: 255 }, img2);
 
     await assert.rejects(
-      async () => await compareScreenshots(img1, img2),
+      async () =>
+        await compareScreenshots(img1, img2, undefined, 0.1, false),
       /Image dimensions don't match/
     );
 
     await fs.unlink(img1);
     await fs.unlink(img2);
+  });
+
+  test("should auto-resize the implementation to the design dimensions by default", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/resize-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/resize-impl.png");
+
+    await createTestPNG(10, 10, { r: 100, g: 150, b: 200, a: 255 }, design);
+    await createTestPNG(20, 20, { r: 100, g: 150, b: 200, a: 255 }, impl);
+
+    const result = await compareScreenshots(design, impl);
+
+    // Comparison runs against the design's dimensions, not the implementation's.
+    assert.strictEqual(result.totalPixels, 100);
+    assert.ok(result.resized);
+    assert.deepStrictEqual(result.resized, {
+      fromWidth: 20,
+      fromHeight: 20,
+      toWidth: 10,
+      toHeight: 10,
+    });
+    // A solid-color resize stays a solid color → identical to the design.
+    assert.strictEqual(result.differentPixels, 0);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
   });
 
   test("should save diff image to file when output path provided", async () => {
@@ -198,6 +225,8 @@ describe("MCP request handling", () => {
     assert.ok(Array.isArray(result.tools));
     const toolNames = result.tools.map((tool) => tool.name);
     assert.ok(toolNames.includes("compare_design"));
+    // version reported via ListTools (in addition to server metadata)
+    assert.strictEqual(result.version, "0.4.0");
   });
 
   test("should return image content when no output path provided", async () => {
@@ -240,5 +269,94 @@ describe("MCP request handling", () => {
 
     assert.strictEqual(response.isError, true);
     assert.ok(response.content[0].text.startsWith("Error comparing screenshots"));
+  });
+
+  test("should accept numeric threshold and succeed", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const img1 = path.join(__dirname, "../test-fixtures/thresh-num-1.png");
+    const img2 = path.join(__dirname, "../test-fixtures/thresh-num-2.png");
+
+    await createTestPNG(6, 6, { r: 50, g: 50, b: 50, a: 255 }, img1);
+    await createTestPNG(6, 6, { r: 200, g: 50, b: 50, a: 255 }, img2);
+
+    const response = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: img1,
+          implementation_path: img2,
+          threshold: 0,
+        },
+      },
+    });
+
+    assert.strictEqual(response.isError, undefined);
+    assert.ok(Array.isArray(response.content));
+    const textItem = response.content.find((c: any) => c.type === "text");
+    assert.ok(textItem);
+    assert.ok(textItem.text.includes("Difference:"));
+    // 0 threshold is sensitive; should report some >0 difference
+    assert.ok(/Difference: [1-9]/.test(textItem.text) || textItem.text.includes("100.00%") || textItem.text.includes("Difference: 100"));
+
+    await fs.unlink(img1);
+    await fs.unlink(img2);
+  });
+
+  test("should report auto-resize in the response text", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/handler-resize-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/handler-resize-impl.png");
+
+    await createTestPNG(8, 8, { r: 120, g: 120, b: 120, a: 255 }, design);
+    await createTestPNG(16, 16, { r: 120, g: 120, b: 120, a: 255 }, impl);
+
+    const response = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: design,
+          implementation_path: impl,
+        },
+      },
+    });
+
+    assert.strictEqual(response.isError, undefined);
+    const textItem = response.content.find((c: any) => c.type === "text");
+    assert.ok(textItem);
+    assert.ok(textItem.text.includes("auto-resized from 16x16 to 8x8"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("should coerce invalid threshold (string) and still succeed using default", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const img1 = path.join(__dirname, "../test-fixtures/thresh-bad-1.png");
+    const img2 = path.join(__dirname, "../test-fixtures/thresh-bad-2.png");
+
+    await createTestPNG(6, 6, { r: 120, g: 120, b: 120, a: 255 }, img1);
+    await createTestPNG(6, 6, { r: 120, g: 121, b: 120, a: 255 }, img2);
+
+    const response = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: img1,
+          implementation_path: img2,
+          threshold: "not-a-number",
+        },
+      },
+    });
+
+    assert.strictEqual(response.isError, undefined);
+    assert.ok(Array.isArray(response.content));
+    const textItem = response.content.find((c: any) => c.type === "text");
+    assert.ok(textItem);
+    assert.ok(textItem.text.includes("Difference:"));
+    // invalid falls back to default 0.1; with tiny delta may be 0% or small, but must be finite valid %
+    assert.ok(/Difference: \d+\.\d+%/.test(textItem.text));
+
+    await fs.unlink(img1);
+    await fs.unlink(img2);
   });
 });
