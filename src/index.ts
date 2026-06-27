@@ -6,165 +6,45 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import fs from "fs/promises";
-import pixelmatch from "pixelmatch";
-import { PNG } from "pngjs";
-import sharp from "sharp";
 import { pathToFileURL } from "url";
+import {
+  compareScreenshots,
+  type IgnoreRegion,
+  type ResizeFit,
+} from "./compare.js";
 
-// Pure normalization for threshold: accepts number | string | other, coerces, clamps to [0,1], defaults to 0.1
-function normalizeThreshold(t: unknown): number {
-  let n: number;
-  if (typeof t === "number") {
-    n = t;
-  } else if (typeof t === "string") {
-    n = parseFloat(t);
-  } else {
-    n = NaN;
-  }
-  if (!Number.isFinite(n)) {
-    return 0.1;
-  }
-  return Math.max(0, Math.min(1, n));
+// Re-export image logic so existing consumers/tests can import from "./index.js".
+export {
+  loadPNG,
+  compareScreenshots,
+  computeSSIM,
+  buildMask,
+  normalizeThreshold,
+} from "./compare.js";
+export type { CompareResult, ResizeFit, IgnoreRegion } from "./compare.js";
+
+const VERSION = "0.5.0";
+
+const RESIZE_FITS: ResizeFit[] = ["fill", "contain", "cover"];
+
+// Extract a human-readable message from an unknown thrown value.
+export function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
-interface CompareResult {
-  totalPixels: number;
-  differentPixels: number;
-  differencePercentage: number;
-  diffImageBase64?: string;
-  resized?: {
-    fromWidth: number;
-    fromHeight: number;
-    toWidth: number;
-    toHeight: number;
-  };
-}
-
-export async function loadPNG(
-  filePath: string,
-  resizeTo?: { width: number; height: number }
-): Promise<PNG> {
-  try {
-    // Check if file exists
-    await fs.access(filePath);
-
-    // Probe metadata first (post-access) to detect unsupported formats robustly.
-    // Avoids fragile reliance on sharp raw/decode error message strings.
-    try {
-      await sharp(filePath).metadata();
-    } catch {
-      throw new Error(`Unsupported image format: ${filePath}`);
-    }
-
-    // Use sharp to convert any image format to PNG buffer
-    // This handles PNG, JPEG, WebP, GIF, TIFF, etc.
-    let pipeline = sharp(filePath).ensureAlpha(); // Ensure RGBA format
-    if (resizeTo) {
-      // fit: "fill" stretches to the exact target dimensions (ignoring aspect
-      // ratio) so the raw buffer lines up with the reference for pixelmatch.
-      pipeline = pipeline.resize(resizeTo.width, resizeTo.height, { fit: "fill" });
-    }
-    const { data, info } = await pipeline
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-
-    // Create PNG object from raw pixel data
-    const png = new PNG({ width: info.width, height: info.height });
-    png.data = data;
-    
-    return png;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new Error(`File not found: ${filePath}`);
-    }
-    if (error instanceof Error && error.message.startsWith('Unsupported image format:')) {
-      throw error;
-    }
-    throw error;
-  }
-}
-
-export async function compareScreenshots(
-  designPath: string,
-  implementationPath: string,
-  outputDiffPath?: string,
-  threshold: unknown = 0.1,
-  autoResize: boolean = true
-): Promise<CompareResult> {
-  const normThreshold = normalizeThreshold(threshold);
-  // Load both images
-  const design = await loadPNG(designPath);
-  let implementation = await loadPNG(implementationPath);
-
-  // Reconcile dimensions: pixelmatch requires identical buffers.
-  let resized: CompareResult["resized"];
-  if (
-    design.width !== implementation.width ||
-    design.height !== implementation.height
-  ) {
-    if (!autoResize) {
-      throw new Error(
-        `Image dimensions don't match: design (${design.width}x${design.height}) vs implementation (${implementation.width}x${implementation.height})`
-      );
-    }
-    // Re-decode the implementation, stretched to the design's dimensions
-    // (the design is the reference) so the comparison can proceed.
-    resized = {
-      fromWidth: implementation.width,
-      fromHeight: implementation.height,
-      toWidth: design.width,
-      toHeight: design.height,
-    };
-    implementation = await loadPNG(implementationPath, {
-      width: design.width,
-      height: design.height,
-    });
-  }
-
-  // Create a diff image
-  const diff = new PNG({ width: design.width, height: design.height });
-
-  // Compare images using pixelmatch
-  const differentPixels = pixelmatch(
-    design.data,
-    implementation.data,
-    diff.data,
-    design.width,
-    design.height,
-    { threshold: normThreshold }
-  );
-
-  const totalPixels = design.width * design.height;
-  const differencePercentage = (differentPixels / totalPixels) * 100;
-
-  const result: CompareResult = {
-    totalPixels,
-    differentPixels,
-    differencePercentage,
-  };
-
-  if (resized) {
-    result.resized = resized;
-  }
-
-  // Save or encode diff image
-  if (outputDiffPath) {
-    await fs.writeFile(outputDiffPath, PNG.sync.write(diff));
-  } else {
-    // Return base64 encoded diff image
-    const buffer = PNG.sync.write(diff);
-    result.diffImageBase64 = buffer.toString("base64");
-  }
-
-  return result;
+// Coerce resize_fit to a valid mode, defaulting to "contain" (mirrors the
+// lenient coercion used for threshold).
+function normalizeResizeFit(value: unknown): ResizeFit {
+  return typeof value === "string" && (RESIZE_FITS as string[]).includes(value)
+    ? (value as ResizeFit)
+    : "contain";
 }
 
 // Create server instance
 const server = new Server(
   {
     name: "mcp-design-comparison",
-    version: "0.4.0",
+    version: VERSION,
   },
   {
     capabilities: {
@@ -179,7 +59,7 @@ export async function handleListToolsRequest() {
       {
         name: "compare_design",
         description:
-          "Compare a design screenshot with an implementation screenshot using pixelmatch. Supports PNG, JPEG, WebP, GIF, and TIFF formats. Returns the number and percentage of different pixels, and optionally outputs a diff image highlighting the differences.",
+          "Compare a design screenshot with an implementation screenshot using pixelmatch and SSIM. Supports PNG, JPEG, WebP, GIF, and TIFF formats. Returns the number and percentage of different pixels, a structural-similarity (SSIM) score, and optionally outputs a diff image highlighting the differences.",
         inputSchema: {
           type: "object",
           properties: {
@@ -205,8 +85,30 @@ export async function handleListToolsRequest() {
             auto_resize: {
               type: "boolean",
               description:
-                "If true (default), the implementation screenshot is stretched to the design's dimensions when they differ, instead of failing. Set false to require identical dimensions.",
+                "If true (default), the implementation screenshot is scaled to the design's dimensions when they differ, instead of failing. Set false to require identical dimensions.",
               default: true,
+            },
+            resize_fit: {
+              type: "string",
+              enum: ["fill", "contain", "cover"],
+              description:
+                "How to scale the implementation when dimensions differ. 'contain' (default) preserves aspect ratio and letterboxes; 'fill' stretches to the exact dimensions; 'cover' preserves aspect ratio and crops the overflow.",
+              default: "contain",
+            },
+            ignore_regions: {
+              type: "array",
+              description:
+                "Rectangles (design-space coordinates) to exclude from the comparison, e.g. dynamic content like timestamps or avatars. Excluded pixels count toward neither the diff nor the percentage denominator.",
+              items: {
+                type: "object",
+                properties: {
+                  x: { type: "number" },
+                  y: { type: "number" },
+                  width: { type: "number" },
+                  height: { type: "number" },
+                },
+                required: ["x", "y", "width", "height"],
+              },
             },
           },
           required: ["design_path", "implementation_path"],
@@ -214,7 +116,7 @@ export async function handleListToolsRequest() {
       },
     ],
     // version is reported via ListTools response (and server metadata) for direct inspection / MCP handshake
-    version: "0.4.0",
+    version: VERSION,
   };
 }
 
@@ -233,6 +135,8 @@ export async function handleCallToolRequest(request: CallToolRequest) {
       output_diff_path?: string;
       threshold?: number;
       auto_resize?: boolean;
+      resize_fit?: string;
+      ignore_regions?: IgnoreRegion[];
     };
     const {
       design_path,
@@ -240,29 +144,39 @@ export async function handleCallToolRequest(request: CallToolRequest) {
       output_diff_path,
       threshold = 0.1,
       auto_resize = true,
+      resize_fit,
+      ignore_regions,
     } = args;
     if (typeof design_path !== "string" || typeof implementation_path !== "string") {
       throw new Error("design_path and implementation_path are required");
     }
 
-    const normThreshold = normalizeThreshold(threshold);
+    const resizeFit = normalizeResizeFit(resize_fit);
+    const ignoreRegions = Array.isArray(ignore_regions) ? ignore_regions : [];
 
     try {
       const result = await compareScreenshots(
         design_path,
         implementation_path,
         output_diff_path,
-        normThreshold,
-        auto_resize
+        threshold,
+        auto_resize,
+        resizeFit,
+        ignoreRegions
       );
 
       let responseText = `Design Comparison Results:\n\n`;
       responseText += `Total Pixels: ${result.totalPixels.toLocaleString()}\n`;
       responseText += `Different Pixels: ${result.differentPixels.toLocaleString()}\n`;
       responseText += `Difference: ${result.differencePercentage.toFixed(2)}%\n`;
+      responseText += `SSIM: ${result.ssim.toFixed(4)} (1.0000 = identical)\n`;
+
+      if (result.maskedPixels) {
+        responseText += `Masked Pixels: ${result.maskedPixels.toLocaleString()} (excluded from comparison)\n`;
+      }
 
       if (result.resized) {
-        responseText += `\nNote: implementation auto-resized from ${result.resized.fromWidth}x${result.resized.fromHeight} to ${result.resized.toWidth}x${result.resized.toHeight} to match the design.\n`;
+        responseText += `\nNote: implementation auto-resized from ${result.resized.fromWidth}x${result.resized.fromHeight} to ${result.resized.toWidth}x${result.resized.toHeight} (${result.resized.fit}) to match the design.\n`;
       }
 
       if (output_diff_path) {
@@ -293,7 +207,7 @@ export async function handleCallToolRequest(request: CallToolRequest) {
         content: [
           {
             type: "text",
-            text: `Error comparing screenshots: ${error instanceof Error ? error.message : String(error)}`,
+            text: `Error comparing screenshots: ${formatError(error)}`,
           },
         ],
         isError: true,
@@ -310,7 +224,8 @@ server.setRequestHandler(ListToolsRequestSchema, handleListToolsRequest);
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, handleCallToolRequest);
 
-// Start the server
+/* node:coverage disable */
+// Server bootstrap: exercised only when run as an executable, not under test.
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -324,3 +239,4 @@ if (entryPoint && import.meta.url === pathToFileURL(entryPoint).href) {
     process.exit(1);
   });
 }
+/* node:coverage enable */

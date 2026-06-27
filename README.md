@@ -6,7 +6,9 @@ An MCP (Model Context Protocol) server that allows LLMs to compare design screen
 
 - **Multi-Format Support**: Works with PNG, JPEG, WebP, GIF, and TIFF images
 - **Screenshot Comparison**: Compare two images pixel-by-pixel
-- **Auto-Resize**: Mismatched resolutions are reconciled automatically — the implementation is scaled to the design's dimensions (toggle off with `auto_resize`)
+- **SSIM Score**: Structural-similarity metric (0–1) that tracks perceived difference, not just raw pixel deltas
+- **Auto-Resize**: Mismatched resolutions are reconciled automatically — the implementation is scaled to the design's dimensions. `resize_fit` controls how (`contain` preserves aspect ratio by default; `fill`/`cover` available); toggle off with `auto_resize`
+- **Ignore Regions**: Exclude rectangles (e.g. timestamps, avatars) from the comparison so dynamic content doesn't count
 - **Visual Diff Output**: Generate a highlighted diff image showing differences
 - **Detailed Metrics**: Get total pixels, different pixels, and percentage difference
 - **Configurable Threshold**: Adjust sensitivity of the comparison
@@ -53,11 +55,14 @@ Compare a design screenshot with an implementation screenshot.
 - `output_diff_path` (string, optional): Path to save the diff image (always saved as PNG). If not provided, the diff image will be returned as base64
 - `threshold` (number, optional): Matching threshold (0-1). Smaller values make the comparison more sensitive. Default is 0.1
 - `auto_resize` (boolean, optional): When the two screenshots differ in resolution, scale the implementation to the design's dimensions instead of erroring. Default is `true`. Set `false` to require identical dimensions.
+- `resize_fit` (string, optional): How to scale the implementation when dimensions differ — `contain` (default, preserves aspect ratio and letterboxes), `fill` (stretches to exact dimensions), or `cover` (preserves aspect ratio and crops overflow).
+- `ignore_regions` (array, optional): Rectangles `{ x, y, width, height }` in design-space coordinates to exclude from the comparison (e.g. dynamic content). Excluded pixels count toward neither the diff nor the percentage denominator.
 
 **Returns:**
-- Total number of pixels
+- Total number of pixels (excluding any ignored regions)
 - Number of different pixels
 - Percentage difference
+- SSIM score (0–1, where 1.0 means identical)
 - Diff image (as file or base64)
 
 ### Configuration Example
@@ -95,10 +100,11 @@ After adding the configuration, restart Claude Desktop or Cursor.
 ## How It Works
 
 1. Loads both images into memory (any supported format → raw RGBA)
-2. If dimensions differ, scales the implementation to the design's dimensions (unless `auto_resize` is `false`, which errors instead)
-3. Uses pixelmatch to compare pixel-by-pixel
-4. Generates a diff image highlighting differences in pink
-5. Returns statistics and the diff image
+2. If dimensions differ, scales the implementation to the design's dimensions using `resize_fit` (default `contain`, aspect-preserving; unless `auto_resize` is `false`, which errors instead)
+3. Masks out any `ignore_regions` in both images so excluded pixels don't count
+4. Uses pixelmatch to compare pixel-by-pixel and computes an SSIM score
+5. Generates a diff image highlighting differences in pink
+6. Returns statistics, the SSIM score, and the diff image
 
 ## Example Use Cases
 

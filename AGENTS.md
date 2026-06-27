@@ -21,31 +21,33 @@ npm run watch
 
 ## Architecture
 
-### Single-file MCP Server (`src/index.ts`)
+### Module split
 
-The entire server is implemented in one file with three main components:
+The server is split into two files:
 
-1. **Image Processing Functions**:
-   - `loadPNG()`: Loads images in multiple formats (PNG, JPEG, WebP, GIF, TIFF) using sharp, converts to raw pixel data
-   - `compareScreenshots()`: Core comparison logic using pixelmatch, returns metrics and diff image
+- **`src/compare.ts`** — image logic (no MCP concerns):
+  - `loadPNG()`: loads images in multiple formats (PNG, JPEG, WebP, GIF, TIFF) using sharp, converts to raw RGBA; optional resize with a `fit` mode (`fill`/`contain`/`cover`)
+  - `buildMask()`: turns `ignore_regions` rectangles into a boolean mask (validates, clamps out-of-bounds, drops zero-area, throws on malformed input)
+  - `computeSSIM()`: mean structural similarity (0–1) via `ssim.js`, window size shrinks for small images
+  - `compareScreenshots()`: reconcile dimensions → mask → pixelmatch + SSIM, returns metrics and diff image
+- **`src/index.ts`** — MCP wiring: re-exports the image logic (so `./index.js` imports stay stable), registers `ListToolsRequestSchema`/`CallToolRequestSchema` handlers, and bootstraps the stdio server.
 
-2. **MCP Server Setup**: 
-   - Uses `@modelcontextprotocol/sdk` with stdio transport
-   - Registers handlers for `ListToolsRequestSchema` and `CallToolRequestSchema`
+### Tool Implementation (`compare_design`)
 
-3. **Tool Implementation** (`compare_design`):
-   - Accepts two PNG paths, optional output path, threshold (0-1), and `auto_resize` flag
-   - Returns text response with statistics + optional base64 image or saves to file
-   - When dimensions differ, scales the implementation to the design's dimensions (or errors if `auto_resize` is `false`)
+- Accepts two image paths, optional output path, `threshold` (0–1), `auto_resize` flag, `resize_fit` (`fill`/`contain`/`cover`, default `contain`), and `ignore_regions` (array of `{x,y,width,height}`)
+- Order of operations: resize-reconcile (using `resize_fit`) → mask `ignore_regions` in both buffers → pixelmatch + SSIM on the masked buffers
+- Masked pixels are excluded from both the diff and the percentage denominator (`totalPixels = W*H − maskedCount`)
+- Returns text response with statistics + SSIM score + optional base64 image or saves to file
 
 ### Key Constraints
 
 - Supports PNG, JPEG, WebP, GIF, and TIFF formats (via sharp library)
-- Differing dimensions are auto-resized by default (implementation → design); pass `auto_resize: false` to require identical dimensions
+- Differing dimensions are auto-resized by default (implementation → design) using `resize_fit` (default `contain`, aspect-preserving); pass `auto_resize: false` to require identical dimensions
+- SSIM is advisory — it is reported but not gated by `threshold` (which applies to pixelmatch only). SSIM is computed on the masked buffers, so `ignore_regions` are treated as identical (SSIM does not penalize masked content), matching how pixelmatch excludes them
+- `ssim.js` is pure JS with no native deps; sharp requires native binaries (handled during npm install)
 - Server runs on stdio (not HTTP) - designed for local MCP client communication
 - Uses ES modules (`"type": "module"` in package.json)
 - TypeScript compilation uses `Node16` module resolution
-- Sharp library requires native binaries (automatically handled during npm install)
 
 ## Testing the Server
 
@@ -84,5 +86,6 @@ The server validates:
 - File existence before attempting to read
 - Image format support (PNG, JPEG, WebP, GIF, TIFF)
 - Image dimensions before comparison — reconciled via auto-resize, or rejected when `auto_resize` is `false`
+- `ignore_regions` shape — malformed input (non-numeric coordinates, or negative width/height) throws; out-of-bounds rectangles are clamped
 
 Sharp automatically handles format detection and conversion, preventing format-related errors. JPEG files with .png extensions are automatically handled correctly.
