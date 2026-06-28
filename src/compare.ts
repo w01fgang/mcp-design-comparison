@@ -3,6 +3,9 @@ import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 import sharp from "sharp";
 import { ssim } from "ssim.js";
+import { Try, type TryResult } from "@power-rent/try-catch";
+
+export type { TryResult };
 
 export type ResizeFit = "fill" | "contain" | "cover";
 
@@ -31,6 +34,12 @@ export interface CompareResult {
   };
 }
 
+// Single failure-result factory for the no-throw API (the failure variant is
+// independent of the success value type, so it fits any TryResult<T>).
+function fail(message: string): { success: false; error: Error } {
+  return { success: false, error: new Error(message) };
+}
+
 // Pure normalization for threshold: accepts number | string | other, coerces, clamps to [0,1], defaults to 0.1
 export function normalizeThreshold(t: unknown): number {
   let n: number;
@@ -47,28 +56,37 @@ export function normalizeThreshold(t: unknown): number {
   return Math.max(0, Math.min(1, n));
 }
 
+// Existence check shared by loadPNG and probeDimensions: maps a missing file to
+// a "File not found" failure (no-throw).
+async function checkExists(filePath: string): Promise<TryResult<void>> {
+  const access = await new Try(() => fs.access(filePath)).result();
+  if (!access.success) {
+    return fail(`File not found: ${filePath}`);
+  }
+  return { success: true, value: undefined };
+}
+
+/**
+ * Decode an image of any supported format to a raw-RGBA pngjs PNG. No-throw:
+ * returns a discriminated TryResult instead of throwing. A missing file maps to
+ * "File not found"; any decode failure maps to "Unsupported image format" and
+ * carries the underlying cause (no longer swallowed).
+ */
 export async function loadPNG(
   filePath: string,
   resizeTo?: { width: number; height: number; fit: ResizeFit }
-): Promise<PNG> {
-  try {
-    // Check if file exists
-    await fs.access(filePath);
+): Promise<TryResult<PNG>> {
+  const exists = await checkExists(filePath);
+  if (!exists.success) {
+    return exists;
+  }
 
-    // Probe metadata first (post-access) to detect unsupported formats robustly.
-    // Avoids fragile reliance on sharp raw/decode error message strings.
-    try {
-      await sharp(filePath).metadata();
-    } catch {
-      throw new Error(`Unsupported image format: ${filePath}`);
-    }
-
-    // Use sharp to convert any image format to PNG buffer
-    // This handles PNG, JPEG, WebP, GIF, TIFF, etc.
-    let pipeline = sharp(filePath).ensureAlpha(); // Ensure RGBA format
+  // Decode (and optional resize) in one pass; capturing the real error here is
+  // what distinguishes a genuine format problem from a swallowed cause.
+  const decoded = await new Try(() => {
+    let pipeline = sharp(filePath).ensureAlpha(); // RGBA
     if (resizeTo) {
-      // The implementation is scaled to the design's dimensions so the raw
-      // buffer lines up with the reference for pixelmatch. `fit` controls how:
+      // `fit` controls scaling when reconciling dimensions:
       //   contain — preserve aspect, letterbox the remainder (transparent pad)
       //   fill    — stretch to exact dims, ignoring aspect
       //   cover   — preserve aspect, crop the overflow
@@ -77,45 +95,60 @@ export async function loadPNG(
         background: { r: 0, g: 0, b: 0, alpha: 0 },
       });
     }
-    const { data, info } = await pipeline
-      .raw()
-      .toBuffer({ resolveWithObject: true });
+    return pipeline.raw().toBuffer({ resolveWithObject: true });
+  }).result();
 
-    // Create PNG object from raw pixel data
-    const png = new PNG({ width: info.width, height: info.height });
-    png.data = data;
-
-    return png;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new Error(`File not found: ${filePath}`);
-    }
-    // Unsupported-format and any other error propagate unchanged.
-    throw error;
+  if (!decoded.success) {
+    return fail(`Unsupported image format: ${filePath} (${decoded.error.message})`);
   }
+
+  const { data, info } = decoded.value;
+  const png = new PNG({ width: info.width, height: info.height });
+  png.data = data;
+  return { success: true, value: png };
+}
+
+// Read just the header dimensions (cheap — no full decode) while preserving
+// loadPNG's error semantics, so the implementation can be decoded exactly once
+// at the right size instead of decoded at native size and then re-decoded.
+async function probeDimensions(
+  filePath: string
+): Promise<TryResult<{ width: number; height: number }>> {
+  const exists = await checkExists(filePath);
+  if (!exists.success) {
+    return exists;
+  }
+  const meta = await new Try(() => sharp(filePath).metadata()).result();
+  if (!meta.success) {
+    return fail(`Unsupported image format: ${filePath} (${meta.error.message})`);
+  }
+  return { success: true, value: { width: meta.value.width!, height: meta.value.height! } };
 }
 
 /**
  * Build a boolean mask (1 = ignored) from ignore_regions in design-space
- * coordinates. Out-of-bounds rects are clamped; rects that clamp to zero area
- * are dropped. Malformed input (non-finite, or negative width/height) throws.
- * Counting masked pixels from the buffer is overlap- and clamp-safe.
+ * coordinates. No-throw: malformed input (non-object element, non-finite, or
+ * negative width/height) returns a failure TryResult. Out-of-bounds rects are
+ * clamped; rects that clamp to zero area are dropped. The masked count is
+ * accumulated as pixels are first set, so it is overlap- and clamp-safe.
  */
 export function buildMask(
   width: number,
   height: number,
   regions: IgnoreRegion[]
-): { mask: Uint8Array; maskedCount: number } {
+): TryResult<{ mask: Uint8Array; maskedCount: number }> {
   const mask = new Uint8Array(width * height);
+  let maskedCount = 0;
 
   for (const r of regions) {
+    if (r === null || typeof r !== "object") {
+      return fail("ignore_regions: each region needs numeric x, y, width, height");
+    }
     if (![r.x, r.y, r.width, r.height].every((v) => Number.isFinite(v))) {
-      throw new Error(
-        "ignore_regions: each region needs numeric x, y, width, height"
-      );
+      return fail("ignore_regions: each region needs numeric x, y, width, height");
     }
     if (r.width < 0 || r.height < 0) {
-      throw new Error("ignore_regions: width and height must be non-negative");
+      return fail("ignore_regions: width and height must be non-negative");
     }
 
     const x0 = Math.max(0, Math.floor(r.x));
@@ -129,16 +162,16 @@ export function buildMask(
     for (let y = y0; y < y1; y++) {
       const row = y * width;
       for (let x = x0; x < x1; x++) {
-        mask[row + x] = 1;
+        const k = row + x;
+        if (!mask[k]) {
+          mask[k] = 1;
+          maskedCount++; // count on first set → overlap-safe, single pass
+        }
       }
     }
   }
 
-  let maskedCount = 0;
-  for (let i = 0; i < mask.length; i++) {
-    if (mask[i]) maskedCount++;
-  }
-  return { mask, maskedCount };
+  return { success: true, value: { mask, maskedCount } };
 }
 
 // Paint masked pixels transparent so both buffers read identical there.
@@ -157,23 +190,19 @@ function applyMask(data: Buffer, mask: Uint8Array): void {
 // Zero-copy view over pngjs Buffer to satisfy ssim.js's Uint8ClampedArray input.
 function toImageData(png: PNG) {
   return {
-    data: new Uint8ClampedArray(
-      png.data.buffer,
-      png.data.byteOffset,
-      png.data.byteLength
-    ),
+    data: new Uint8ClampedArray(png.data.buffer, png.data.byteOffset, png.data.byteLength),
     width: png.width,
     height: png.height,
   };
 }
 
 /**
- * Mean structural similarity (0..1, 1 = identical). The window size shrinks for
- * images smaller than the default 11×11 window so tiny images stay valid.
+ * Mean structural similarity (0..1, 1 = identical). Pure computation over two
+ * equal-dimension buffers — does not throw for valid inputs, so it returns a
+ * plain number rather than a TryResult. The window shrinks for images smaller
+ * than the default 11×11 so tiny images stay valid.
  */
 export function computeSSIM(a: PNG, b: PNG): number {
-  // Shrink the window for images smaller than the default 11×11 so tiny images
-  // stay valid (loadPNG always yields ≥1×1, so the window is always ≥1).
   const windowSize = Math.min(11, a.width, a.height);
   return ssim(toImageData(a), toImageData(b), { windowSize }).mssim;
 }
@@ -186,95 +215,107 @@ export async function compareScreenshots(
   autoResize: boolean = true,
   resizeFit: ResizeFit = "contain",
   ignoreRegions: IgnoreRegion[] = []
-): Promise<CompareResult> {
+): Promise<TryResult<CompareResult>> {
   const normThreshold = normalizeThreshold(threshold);
-  // Load both images
-  const design = await loadPNG(designPath);
-  let implementation = await loadPNG(implementationPath);
 
-  // Reconcile dimensions: pixelmatch requires identical buffers.
+  // The design is the reference — always decoded in full at its native size.
+  const designR = await loadPNG(designPath);
+  if (!designR.success) {
+    return designR;
+  }
+  const design = designR.value;
+
+  // Probe the implementation's dimensions (header only) before decoding, so a
+  // resize decodes it once at the target size rather than decoding at native
+  // size and discarding that buffer.
+  const probe = await probeDimensions(implementationPath);
+  if (!probe.success) {
+    return probe;
+  }
+  const { width: implWidth, height: implHeight } = probe.value;
+
   let resized: CompareResult["resized"];
-  if (
-    design.width !== implementation.width ||
-    design.height !== implementation.height
-  ) {
+  if (design.width !== implWidth || design.height !== implHeight) {
     if (!autoResize) {
-      throw new Error(
-        `Image dimensions don't match: design (${design.width}x${design.height}) vs implementation (${implementation.width}x${implementation.height})`
+      return fail(
+        `Image dimensions don't match: design (${design.width}x${design.height}) vs implementation (${implWidth}x${implHeight})`
       );
     }
-    // Re-decode the implementation, scaled to the design's dimensions
-    // (the design is the reference) so the comparison can proceed.
     resized = {
-      fromWidth: implementation.width,
-      fromHeight: implementation.height,
+      fromWidth: implWidth,
+      fromHeight: implHeight,
       toWidth: design.width,
       toHeight: design.height,
       fit: resizeFit,
     };
-    implementation = await loadPNG(implementationPath, {
-      width: design.width,
-      height: design.height,
-      fit: resizeFit,
-    });
   }
+  // Derive the resize target from the (single) resized record so the two never
+  // drift apart.
+  const resizeTo = resized
+    ? { width: resized.toWidth, height: resized.toHeight, fit: resized.fit }
+    : undefined;
+
+  const implR = await loadPNG(implementationPath, resizeTo);
+  if (!implR.success) {
+    return implR;
+  }
+  const implementation = implR.value;
 
   // Mask out ignored regions before any metric so dynamic content (timestamps,
   // avatars) does not count. Both buffers are painted identical inside the mask.
-  const { mask, maskedCount } = buildMask(
-    design.width,
-    design.height,
-    ignoreRegions
-  );
+  const maskR = buildMask(design.width, design.height, ignoreRegions);
+  if (!maskR.success) {
+    return maskR;
+  }
+  const { mask, maskedCount } = maskR.value;
   if (maskedCount > 0) {
     applyMask(design.data, mask);
     applyMask(implementation.data, mask);
   }
 
-  // Create a diff image
-  const diff = new PNG({ width: design.width, height: design.height });
+  // Compute metrics and encode the diff inside a no-throw boundary so the whole
+  // function honors its TryResult contract: pixelmatch, ssim.js, PNG allocation,
+  // and PNG encoding all throw synchronously on pathological input.
+  return new Try(async () => {
+    const diff = new PNG({ width: design.width, height: design.height });
 
-  // Compare images using pixelmatch
-  const differentPixels = pixelmatch(
-    design.data,
-    implementation.data,
-    diff.data,
-    design.width,
-    design.height,
-    { threshold: normThreshold }
-  );
+    const differentPixels = pixelmatch(
+      design.data,
+      implementation.data,
+      diff.data,
+      design.width,
+      design.height,
+      { threshold: normThreshold }
+    );
 
-  // Structural similarity on the same (reconciled, masked) buffers.
-  const ssimScore = computeSSIM(design, implementation);
+    // Structural similarity on the same (reconciled, masked) buffers.
+    const ssimScore = computeSSIM(design, implementation);
 
-  // Masked pixels are identical by construction; exclude them from the
-  // denominator so masking cannot dilute the percentage.
-  const totalPixels = design.width * design.height - maskedCount;
-  const differencePercentage =
-    totalPixels > 0 ? (differentPixels / totalPixels) * 100 : 0;
+    // Masked pixels are identical by construction; exclude them from the
+    // denominator so masking cannot dilute the percentage. totalPixels === 0
+    // means the whole image was masked (the handler notes SSIM is meaningless).
+    const totalPixels = design.width * design.height - maskedCount;
+    const differencePercentage = totalPixels > 0 ? (differentPixels / totalPixels) * 100 : 0;
 
-  const result: CompareResult = {
-    totalPixels,
-    differentPixels,
-    differencePercentage,
-    ssim: ssimScore,
-  };
+    const value: CompareResult = {
+      totalPixels,
+      differentPixels,
+      differencePercentage,
+      ssim: ssimScore,
+    };
+    if (maskedCount > 0) {
+      value.maskedPixels = maskedCount;
+    }
+    if (resized) {
+      value.resized = resized;
+    }
 
-  if (maskedCount > 0) {
-    result.maskedPixels = maskedCount;
-  }
-  if (resized) {
-    result.resized = resized;
-  }
+    if (outputDiffPath) {
+      await fs.writeFile(outputDiffPath, PNG.sync.write(diff));
+    } else {
+      value.diffImageBase64 = PNG.sync.write(diff).toString("base64");
+    }
 
-  // Save or encode diff image
-  if (outputDiffPath) {
-    await fs.writeFile(outputDiffPath, PNG.sync.write(diff));
-  } else {
-    // Return base64 encoded diff image
-    const buffer = PNG.sync.write(diff);
-    result.diffImageBase64 = buffer.toString("base64");
-  }
-
-  return result;
+    return value;
+  }).result();
 }

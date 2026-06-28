@@ -21,16 +21,11 @@ export {
   buildMask,
   normalizeThreshold,
 } from "./compare.js";
-export type { CompareResult, ResizeFit, IgnoreRegion } from "./compare.js";
+export type { CompareResult, ResizeFit, IgnoreRegion, TryResult } from "./compare.js";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 
 const RESIZE_FITS: ResizeFit[] = ["fill", "contain", "cover"];
-
-// Extract a human-readable message from an unknown thrown value.
-export function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 
 // Coerce resize_fit to a valid mode, defaulting to "contain" (mirrors the
 // lenient coercion used for threshold).
@@ -38,6 +33,14 @@ function normalizeResizeFit(value: unknown): ResizeFit {
   return typeof value === "string" && (RESIZE_FITS as string[]).includes(value)
     ? (value as ResizeFit)
     : "contain";
+}
+
+// Standard MCP error response (no-throw: returned, not thrown).
+function errorResponse(text: string) {
+  return {
+    content: [{ type: "text" as const, text }],
+    isError: true,
+  };
 }
 
 // Create server instance
@@ -115,7 +118,8 @@ export async function handleListToolsRequest() {
         },
       },
     ],
-    // version is reported via ListTools response (and server metadata) for direct inspection / MCP handshake
+    // version surfaced in the ListTools result for direct inspection/tests; the
+    // MCP handshake version comes from serverInfo (Server config above), not this field.
     version: VERSION,
   };
 }
@@ -127,13 +131,15 @@ interface CallToolRequest {
   };
 }
 
-export async function handleCallToolRequest(request: CallToolRequest) {
+export async function handleCallToolRequest(
+  request: CallToolRequest
+): Promise<{ content: any[]; isError?: boolean }> {
   if (request.params.name === "compare_design") {
     const args = (request.params.arguments ?? {}) as {
       design_path?: string;
       implementation_path?: string;
       output_diff_path?: string;
-      threshold?: number;
+      threshold?: unknown;
       auto_resize?: boolean;
       resize_fit?: string;
       ignore_regions?: IgnoreRegion[];
@@ -142,77 +148,73 @@ export async function handleCallToolRequest(request: CallToolRequest) {
       design_path,
       implementation_path,
       output_diff_path,
-      threshold = 0.1,
+      threshold,
       auto_resize = true,
       resize_fit,
       ignore_regions,
     } = args;
     if (typeof design_path !== "string" || typeof implementation_path !== "string") {
-      throw new Error("design_path and implementation_path are required");
+      return errorResponse("design_path and implementation_path are required");
     }
 
     const resizeFit = normalizeResizeFit(resize_fit);
     const ignoreRegions = Array.isArray(ignore_regions) ? ignore_regions : [];
 
-    try {
-      const result = await compareScreenshots(
-        design_path,
-        implementation_path,
-        output_diff_path,
-        threshold,
-        auto_resize,
-        resizeFit,
-        ignoreRegions
-      );
+    const result = await compareScreenshots(
+      design_path,
+      implementation_path,
+      output_diff_path,
+      threshold,
+      auto_resize,
+      resizeFit,
+      ignoreRegions
+    );
 
-      let responseText = `Design Comparison Results:\n\n`;
-      responseText += `Total Pixels: ${result.totalPixels.toLocaleString()}\n`;
-      responseText += `Different Pixels: ${result.differentPixels.toLocaleString()}\n`;
-      responseText += `Difference: ${result.differencePercentage.toFixed(2)}%\n`;
-      responseText += `SSIM: ${result.ssim.toFixed(4)} (1.0000 = identical)\n`;
-
-      if (result.maskedPixels) {
-        responseText += `Masked Pixels: ${result.maskedPixels.toLocaleString()} (excluded from comparison)\n`;
-      }
-
-      if (result.resized) {
-        responseText += `\nNote: implementation auto-resized from ${result.resized.fromWidth}x${result.resized.fromHeight} to ${result.resized.toWidth}x${result.resized.toHeight} (${result.resized.fit}) to match the design.\n`;
-      }
-
-      if (output_diff_path) {
-        responseText += `\nDiff image saved to: ${output_diff_path}`;
-      }
-
-      const content: any[] = [
-        {
-          type: "text",
-          text: responseText,
-        },
-      ];
-
-      // If we have base64 image data, include it
-      if (result.diffImageBase64) {
-        content.push({
-          type: "image",
-          data: result.diffImageBase64,
-          mimeType: "image/png",
-        });
-      }
-
-      return {
-        content,
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error comparing screenshots: ${formatError(error)}`,
-          },
-        ],
-        isError: true,
-      };
+    if (!result.success) {
+      return errorResponse(`Error comparing screenshots: ${result.error.message}`);
     }
+
+    const value = result.value;
+    let responseText = `Design Comparison Results:\n\n`;
+    responseText += `Total Pixels: ${value.totalPixels.toLocaleString()}\n`;
+    responseText += `Different Pixels: ${value.differentPixels.toLocaleString()}\n`;
+    responseText += `Difference: ${value.differencePercentage.toFixed(2)}%\n`;
+    responseText += `SSIM: ${value.ssim.toFixed(4)} (1.0000 = identical)\n`;
+
+    if (value.totalPixels === 0) {
+      // Whole image masked → nothing actually compared; SSIM over two
+      // all-transparent buffers is 1.0 and would otherwise read as "identical".
+      responseText += `Note: no pixels compared (entire image masked); the SSIM score is not meaningful.\n`;
+    }
+    if (value.maskedPixels) {
+      responseText += `Masked Pixels: ${value.maskedPixels.toLocaleString()} (excluded from comparison)\n`;
+    }
+
+    if (value.resized) {
+      responseText += `\nNote: implementation auto-resized from ${value.resized.fromWidth}x${value.resized.fromHeight} to ${value.resized.toWidth}x${value.resized.toHeight} (${value.resized.fit}) to match the design.\n`;
+    }
+
+    if (output_diff_path) {
+      responseText += `\nDiff image saved to: ${output_diff_path}`;
+    }
+
+    const content: any[] = [
+      {
+        type: "text",
+        text: responseText,
+      },
+    ];
+
+    // If we have base64 image data, include it
+    if (value.diffImageBase64) {
+      content.push({
+        type: "image",
+        data: value.diffImageBase64,
+        mimeType: "image/png",
+      });
+    }
+
+    return { content };
   }
 
   throw new Error(`Unknown tool: ${request.params.name}`);
