@@ -735,6 +735,32 @@ describe("MCP request handling", () => {
     await fs.unlink(impl);
   });
 
+  test("returns error (isError) when ignore_regions is not an array", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/h-badmask-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/h-badmask-impl.png");
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    // A single rectangle object (not wrapped in an array) must fail loud
+    // rather than be silently treated as "no ignored regions".
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: design,
+          implementation_path: impl,
+          ignore_regions: { x: 0, y: 0, width: 5, height: 10 },
+        },
+      },
+    });
+    assert.strictEqual(res.isError, true);
+    assert.ok(res.content[0].text.includes("ignore_regions must be an array"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
   test("saves diff to file and omits base64 image when output path given", async () => {
     const { handleCallToolRequest } = await import("./index.js");
     const design = path.join(__dirname, "../test-fixtures/h-out-design.png");

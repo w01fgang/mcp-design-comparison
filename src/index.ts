@@ -142,7 +142,7 @@ export async function handleCallToolRequest(
       threshold?: unknown;
       auto_resize?: boolean;
       resize_fit?: string;
-      ignore_regions?: IgnoreRegion[];
+      ignore_regions?: unknown;
     };
     const {
       design_path,
@@ -158,7 +158,16 @@ export async function handleCallToolRequest(
     }
 
     const resizeFit = normalizeResizeFit(resize_fit);
-    const ignoreRegions = Array.isArray(ignore_regions) ? ignore_regions : [];
+    // Distinguish "not provided" (default to no mask) from "provided but
+    // malformed". Coercing a non-array value to [] would silently drop a
+    // caller's mask request and run a noisy comparison; region errors must
+    // fail loud, so reject non-array input here before buildMask sees it.
+    if (ignore_regions !== undefined && !Array.isArray(ignore_regions)) {
+      return errorResponse(
+        "ignore_regions must be an array of {x, y, width, height} regions"
+      );
+    }
+    const ignoreRegions = (ignore_regions ?? []) as IgnoreRegion[];
 
     const result = await compareScreenshots(
       design_path,
