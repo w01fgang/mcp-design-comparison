@@ -1610,3 +1610,56 @@ describe("SVG comparison", () => {
     await fs.unlink(impl);
   });
 });
+
+describe("svg_density in the handler", () => {
+  test("exposes svg_density in the tool schema", async () => {
+    const { handleListToolsRequest } = await import("./index.js");
+    const result = await handleListToolsRequest();
+    const schema = result.tools[0].inputSchema.properties as Record<string, unknown>;
+    assert.ok(schema.svg_density);
+  });
+
+  test("passes svg_density through and compares an SVG at the requested density", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/h-svg.svg");
+    const impl = path.join(__dirname, "../test-fixtures/h-svg-impl.png");
+    await createTestSVG(SVG_RED_36, svgPath);
+    await createTestPNG(72, 72, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: svgPath, implementation_path: impl, svg_density: 144 },
+      },
+    });
+    assert.strictEqual(res.isError, undefined);
+    const textItem = res.content.find((c: any) => c.type === "text");
+    // 36x36 @ 144 dpi → 72x72 reference = 5,184 pixels
+    assert.ok(textItem.text.includes("Total Pixels: 5,184"));
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+
+  test("returns isError on invalid svg_density", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/h-svg-bad-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/h-svg-bad-impl.png");
+    await createTestPNG(8, 8, { r: 1, g: 1, b: 1, a: 255 }, design);
+    await createTestPNG(8, 8, { r: 1, g: 1, b: 1, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, svg_density: 0 },
+      },
+    });
+    assert.strictEqual(res.isError, true);
+    assert.ok(
+      res.content[0].text.includes("svg_density must be a positive, finite number")
+    );
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+});

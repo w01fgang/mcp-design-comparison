@@ -133,6 +133,12 @@ export async function handleListToolsRequest() {
                 "If true (default), include a diff bounding box and a coarse per-cell heat grid in the result, showing where differences cluster. Set false to skip the extra pass.",
               default: true,
             },
+            svg_density: {
+              type: "number",
+              description:
+                "Rasterization density (DPI) for SVG inputs. Higher = crisper vector render before comparison. Default 288 (4x the 72dpi baseline). Aimed at small assets (icons/logos); lower it for large vector art.",
+              default: 288,
+            },
           },
           required: ["design_path", "implementation_path"],
         },
@@ -165,6 +171,7 @@ export async function handleCallToolRequest(
       ignore_regions?: unknown;
       max_difference_percentage?: unknown;
       localize?: boolean;
+      svg_density?: unknown;
     };
     const {
       design_path,
@@ -176,6 +183,7 @@ export async function handleCallToolRequest(
       ignore_regions,
       max_difference_percentage,
       localize = true,
+      svg_density,
     } = args;
     if (typeof design_path !== "string" || typeof implementation_path !== "string") {
       return errorResponse("design_path and implementation_path are required");
@@ -214,7 +222,8 @@ export async function handleCallToolRequest(
       auto_resize,
       resizeFit,
       ignoreRegions,
-      localize
+      localize,
+      svg_density
     );
 
     if (!result.success) {
