@@ -971,6 +971,9 @@ describe("max_difference_percentage gate", () => {
     // full stats survive into the gate-trip error
     assert.ok(textItem.text.includes("Total Pixels:"));
     assert.ok(textItem.text.includes("SSIM:"));
+    // localization output survives into the gate-trip error too
+    assert.ok(textItem.text.includes("Diff bounds:"));
+    assert.ok(textItem.text.includes("Heat (3x3, % diff):"));
     // diff artifact survives (base64 output mode)
     assert.ok(res.content.some((c: any) => c.type === "image"));
 
