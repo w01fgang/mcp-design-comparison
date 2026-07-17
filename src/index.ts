@@ -20,8 +20,16 @@ export {
   computeSSIM,
   buildMask,
   normalizeThreshold,
+  localizeDiff,
 } from "./compare.js";
-export type { CompareResult, ResizeFit, IgnoreRegion, TryResult } from "./compare.js";
+export type {
+  CompareResult,
+  ResizeFit,
+  IgnoreRegion,
+  TryResult,
+  DiffBounds,
+  HeatGrid,
+} from "./compare.js";
 
 const VERSION = "0.6.0";
 

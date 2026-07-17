@@ -32,6 +32,10 @@ export interface CompareResult {
     toHeight: number;
     fit: ResizeFit;
   };
+  /** Bounding box of differing pixels in design space; null = zero differing pixels. Omitted when localize=false. */
+  diffBounds?: DiffBounds | null;
+  /** Coarse per-cell diff heat grid. Zero diffs → all-zero cells. Omitted when localize=false. */
+  heatGrid?: HeatGrid;
 }
 
 // Single failure-result factory for the no-throw API (the failure variant is
@@ -207,6 +211,86 @@ export function computeSSIM(a: PNG, b: PNG): number {
   return ssim(toImageData(a), toImageData(b), { windowSize }).mssim;
 }
 
+export interface DiffBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface HeatGrid {
+  rows: number;
+  cols: number;
+  /** Row-major, per-cell % of that cell's unmasked pixels (0–100). */
+  cells: number[];
+}
+
+/**
+ * Locate pixelmatch differences: bounding box + coarse heat grid, in one
+ * O(W·H) pass over the diff buffer. A pixel counts as changed ⇔ its diff pixel
+ * equals pixelmatch's red marker (255, 0, 0, 255) — anti-aliased pixels
+ * (yellow) and unchanged pixels (grayscale) are excluded, so the population is
+ * exactly `differentPixels`. Masked pixels are skipped from each cell's
+ * denominator (and are painted grayscale, never red, so they cannot enter the
+ * numerator). Cell boundaries sit at floor(W/cols) / floor(H/rows); the last
+ * column/row absorbs the remainder, so every pixel is counted exactly once.
+ * Pure — does not throw for valid inputs, so it returns a plain value rather
+ * than a TryResult (mirrors computeSSIM).
+ */
+export function localizeDiff(
+  diffData: Buffer,
+  width: number,
+  height: number,
+  mask: Uint8Array,
+  rows: number = 3,
+  cols: number = 3
+): { diffBounds: DiffBounds | null; heatGrid: HeatGrid } {
+  // Math.max(1, ...) keeps the index math valid when the image is smaller than
+  // the grid (floor would yield 0 and divide by zero).
+  const cellW = Math.max(1, Math.floor(width / cols));
+  const cellH = Math.max(1, Math.floor(height / rows));
+
+  const diffCounts = new Array<number>(rows * cols).fill(0);
+  const unmaskedCounts = new Array<number>(rows * cols).fill(0);
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y++) {
+    const rowBase = y * width;
+    const gridRow = Math.min(rows - 1, Math.floor(y / cellH));
+    for (let x = 0; x < width; x++) {
+      const k = rowBase + x;
+      if (mask[k]) {
+        continue; // masked: excluded from both numerator and denominator
+      }
+      const cell = gridRow * cols + Math.min(cols - 1, Math.floor(x / cellW));
+      unmaskedCounts[cell]++;
+      const idx = k << 2;
+      if (
+        diffData[idx] === 255 &&
+        diffData[idx + 1] === 0 &&
+        diffData[idx + 2] === 0 &&
+        diffData[idx + 3] === 255
+      ) {
+        diffCounts[cell]++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  const diffBounds: DiffBounds | null =
+    maxX < 0 ? null : { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 };
+  const cells = diffCounts.map((count, i) =>
+    unmaskedCounts[i] > 0 ? (count / unmaskedCounts[i]) * 100 : 0
+  );
+  return { diffBounds, heatGrid: { rows, cols, cells } };
+}
+
 export async function compareScreenshots(
   designPath: string,
   implementationPath: string,
@@ -214,7 +298,8 @@ export async function compareScreenshots(
   threshold: unknown = 0.1,
   autoResize: boolean = true,
   resizeFit: ResizeFit = "contain",
-  ignoreRegions: IgnoreRegion[] = []
+  ignoreRegions: IgnoreRegion[] = [],
+  localize: boolean = true
 ): Promise<TryResult<CompareResult>> {
   const normThreshold = normalizeThreshold(threshold);
 
@@ -279,6 +364,10 @@ export async function compareScreenshots(
   return new Try(async () => {
     const diff = new PNG({ width: design.width, height: design.height });
 
+    // localizeDiff keys on pixelmatch's default red marker (255, 0, 0, 255).
+    // That invariant holds only while this call never passes diffColor,
+    // diffColorAlt, or diffMask — do not add those options without updating
+    // localizeDiff.
     const differentPixels = pixelmatch(
       design.data,
       implementation.data,
@@ -308,6 +397,12 @@ export async function compareScreenshots(
     }
     if (resized) {
       value.resized = resized;
+    }
+
+    if (localize) {
+      const localization = localizeDiff(diff.data, design.width, design.height, mask);
+      value.diffBounds = localization.diffBounds;
+      value.heatGrid = localization.heatGrid;
     }
 
     if (outputDiffPath) {

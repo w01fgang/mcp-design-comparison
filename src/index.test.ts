@@ -57,6 +57,32 @@ async function createTruncatedPNG(filePath: string): Promise<void> {
   await fs.writeFile(filePath, buf.subarray(0, Math.floor(buf.length * 0.5)));
 }
 
+// design solid red; impl identical except a blue block at the given rect.
+// Deterministic with pixelmatch: solid blocks are never AA-classified, so
+// differentPixels equals the block area exactly (same precedent as the
+// exact-count assertions in the ignore_regions suite).
+async function createQuadrantPair(
+  design: string,
+  impl: string,
+  size: number,
+  block: { x: number; y: number; width: number; height: number }
+): Promise<void> {
+  await fs.mkdir(path.dirname(design), { recursive: true });
+  const d = new PNG({ width: size, height: size });
+  const i = new PNG({ width: size, height: size });
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const idx = (size * y + x) << 2;
+      d.data[idx] = 255; d.data[idx + 1] = 0; d.data[idx + 2] = 0; d.data[idx + 3] = 255;
+      const blue =
+        x >= block.x && x < block.x + block.width && y >= block.y && y < block.y + block.height;
+      i.data[idx] = blue ? 0 : 255; i.data[idx + 1] = 0; i.data[idx + 2] = blue ? 255 : 0; i.data[idx + 3] = 255;
+    }
+  }
+  await fs.writeFile(design, PNG.sync.write(d));
+  await fs.writeFile(impl, PNG.sync.write(i));
+}
+
 // Assert a TryResult succeeded and return its value (no-throw API helper).
 async function expectOk(promise: Promise<any>): Promise<any> {
   const r = await promise;
@@ -1017,5 +1043,209 @@ describe("max_difference_percentage gate", () => {
     await fs.unlink(design);
     await fs.unlink(impl);
     await fs.unlink(diff);
+  });
+});
+
+describe("diff localization", () => {
+  test("counts only red-marker pixels (yellow AA and grayscale excluded)", async () => {
+    const { localizeDiff } = await import("./index.js");
+    const width = 6;
+    const height = 6;
+    const data = Buffer.alloc(width * height * 4, 255); // white, opaque
+    const paint = (x: number, y: number, rgba: number[]) => {
+      const idx = (y * width + x) << 2;
+      data[idx] = rgba[0]; data[idx + 1] = rgba[1]; data[idx + 2] = rgba[2]; data[idx + 3] = rgba[3];
+    };
+    paint(1, 1, [255, 0, 0, 255]); // red marker — counted
+    paint(2, 2, [255, 0, 0, 255]); // red marker — counted
+    paint(3, 3, [255, 255, 0, 255]); // AA yellow — must be excluded
+
+    const { diffBounds, heatGrid } = localizeDiff(
+      data, width, height, new Uint8Array(width * height)
+    );
+    assert.deepStrictEqual(diffBounds, { x: 1, y: 1, width: 2, height: 2 });
+    // 6x6 into 3x3 → 2x2 cells of 4 px. Red (1,1)→cell 0, (2,2)→cell 4.
+    // Yellow (3,3) also lands in cell 4 and would read 50 if counted.
+    assert.deepStrictEqual(heatGrid.cells, [25, 0, 0, 0, 25, 0, 0, 0, 0]);
+    assert.strictEqual(heatGrid.rows, 3);
+    assert.strictEqual(heatGrid.cols, 3);
+  });
+
+  test("floor partition covers every pixel exactly once (10x10 into 3x3)", async () => {
+    const { localizeDiff } = await import("./index.js");
+    const width = 10;
+    const height = 10;
+    const data = Buffer.alloc(width * height * 4);
+    for (let k = 0; k < width * height; k++) {
+      const idx = k << 2;
+      data[idx] = 255; data[idx + 1] = 0; data[idx + 2] = 0; data[idx + 3] = 255;
+    }
+    const { diffBounds, heatGrid } = localizeDiff(
+      data, width, height, new Uint8Array(width * height)
+    );
+    assert.deepStrictEqual(diffBounds, { x: 0, y: 0, width: 10, height: 10 });
+    // all-red: every cell must be exactly 100% — a skipped or double-counted
+    // pixel makes some cell diverge from 100.
+    assert.deepStrictEqual(heatGrid.cells, [100, 100, 100, 100, 100, 100, 100, 100, 100]);
+  });
+
+  test("last row/column absorbs the remainder", async () => {
+    const { localizeDiff } = await import("./index.js");
+    const width = 10;
+    const height = 10;
+    const data = Buffer.alloc(width * height * 4, 255); // white
+    const idx = (9 * width + 9) << 2;
+    data[idx] = 255; data[idx + 1] = 0; data[idx + 2] = 0; data[idx + 3] = 255; // red at (9,9)
+
+    const { diffBounds, heatGrid } = localizeDiff(
+      data, width, height, new Uint8Array(width * height)
+    );
+    assert.deepStrictEqual(diffBounds, { x: 9, y: 9, width: 1, height: 1 });
+    // cell boundaries at floor(10/3)=3 → last cell spans x,y ∈ [6,9]: 4x4 = 16 px
+    assert.strictEqual(heatGrid.cells[8], 6.25); // 1/16 * 100
+    assert.deepStrictEqual(heatGrid.cells.slice(0, 8), [0, 0, 0, 0, 0, 0, 0, 0]);
+  });
+
+  test("grids larger than the image stay in range (2x2 into 3x3)", async () => {
+    const { localizeDiff } = await import("./index.js");
+    const width = 2;
+    const height = 2;
+    const data = Buffer.alloc(width * height * 4, 255);
+    const idx = (1 * width + 1) << 2;
+    data[idx] = 255; data[idx + 1] = 0; data[idx + 2] = 0; data[idx + 3] = 255; // red at (1,1)
+
+    const { diffBounds, heatGrid } = localizeDiff(
+      data, width, height, new Uint8Array(width * height)
+    );
+    assert.deepStrictEqual(diffBounds, { x: 1, y: 1, width: 1, height: 1 });
+    // cellW/cellH clamp to 1: (1,1) → row 1, col 1 → cell 4; empty grid cells report 0
+    assert.deepStrictEqual(heatGrid.cells, [0, 0, 0, 0, 100, 0, 0, 0, 0]);
+  });
+
+  test("quadrant fixture: bbox, heat distribution, and area-weighted invariant", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-quad-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-quad-impl.png");
+    await createQuadrantPair(design, impl, 12, { x: 0, y: 0, width: 6, height: 6 });
+
+    const r = await expectOk(
+      compareScreenshots(design, impl, undefined, 0.1, true, "contain", [], true)
+    );
+    assert.strictEqual(r.differentPixels, 36);
+    assert.deepStrictEqual(r.diffBounds, { x: 0, y: 0, width: 6, height: 6 });
+    // 12x12 into 3x3 → 4x4 cells: blue block covers cell0 fully, cells 1 and 3
+    // half, cell 4 a quarter
+    assert.deepStrictEqual(r.heatGrid.cells, [100, 50, 0, 50, 25, 0, 0, 0, 0]);
+    // area-weighted invariant: all cells equal-sized (no mask) → plain mean of
+    // the cells equals differencePercentage
+    const mean = r.heatGrid.cells.reduce((a: number, b: number) => a + b, 0) / 9;
+    assert.ok(Math.abs(mean - r.differencePercentage) < 1e-9);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("red-marker pixels in the real diff equal differentPixels", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-inv-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-inv-impl.png");
+    await createQuadrantPair(design, impl, 12, { x: 3, y: 4, width: 5, height: 3 });
+
+    const r = await expectOk(compareScreenshots(design, impl));
+    const diffPng = PNG.sync.read(Buffer.from(r.diffImageBase64, "base64"));
+    let red = 0;
+    for (let k = 0; k < diffPng.width * diffPng.height; k++) {
+      const idx = k << 2;
+      if (
+        diffPng.data[idx] === 255 &&
+        diffPng.data[idx + 1] === 0 &&
+        diffPng.data[idx + 2] === 0 &&
+        diffPng.data[idx + 3] === 255
+      ) {
+        red++;
+      }
+    }
+    assert.strictEqual(red, r.differentPixels);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("masked region is excluded from bbox and heat", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-mask-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-mask-impl.png");
+    await createQuadrantPair(design, impl, 12, { x: 0, y: 0, width: 6, height: 6 });
+
+    // mask the top three rows of the blue block → remaining diff is y ∈ [3,5]
+    const r = await expectOk(
+      compareScreenshots(design, impl, undefined, 0.1, true, "contain", [
+        { x: 0, y: 0, width: 6, height: 3 },
+      ], true)
+    );
+    assert.strictEqual(r.maskedPixels, 18);
+    assert.strictEqual(r.differentPixels, 18);
+    assert.deepStrictEqual(r.diffBounds, { x: 0, y: 3, width: 6, height: 3 });
+    // cell0 (x0-3,y0-3): 12 of 16 px masked, remaining 4 all red → 100
+    assert.strictEqual(r.heatGrid.cells[0], 100);
+    // cell1 (x4-7,y0-3): 6 masked, 10 unmasked, 2 red → 20
+    assert.strictEqual(r.heatGrid.cells[1], 20);
+    // cell3 (x0-3,y4-7): unmasked, 8 of 16 red → 50
+    assert.strictEqual(r.heatGrid.cells[3], 50);
+    // cell4 (x4-7,y4-7): 4 of 16 red → 25
+    assert.strictEqual(r.heatGrid.cells[4], 25);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("fully-masked frame → diffBounds null, heatGrid all-zero", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-allmask-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-allmask-impl.png");
+    await createTestPNG(12, 12, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(12, 12, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const r = await expectOk(
+      compareScreenshots(design, impl, undefined, 0.1, true, "contain", [
+        { x: 0, y: 0, width: 12, height: 12 },
+      ], true)
+    );
+    assert.strictEqual(r.diffBounds, null);
+    assert.deepStrictEqual(r.heatGrid.cells, [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("zero-diff run → diffBounds null, heatGrid all-zero", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-zero-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-zero-impl.png");
+    await createTestPNG(9, 9, { r: 7, g: 8, b: 9, a: 255 }, design);
+    await createTestPNG(9, 9, { r: 7, g: 8, b: 9, a: 255 }, impl);
+
+    const r = await expectOk(compareScreenshots(design, impl));
+    assert.strictEqual(r.diffBounds, null);
+    assert.deepStrictEqual(r.heatGrid.cells, [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("localize=false omits both fields", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-off-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-off-impl.png");
+    await createQuadrantPair(design, impl, 12, { x: 0, y: 0, width: 6, height: 6 });
+
+    const r = await expectOk(
+      compareScreenshots(design, impl, undefined, 0.1, true, "contain", [], false)
+    );
+    assert.strictEqual(r.diffBounds, undefined);
+    assert.strictEqual(r.heatGrid, undefined);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
   });
 });
