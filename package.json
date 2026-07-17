@@ -1,6 +1,6 @@
 {
   "name": "mcp-design-comparison",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "MCP server for comparing design screenshots with implementation using pixelmatch",
   "type": "module",
   "main": "dist/index.js",

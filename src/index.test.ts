@@ -570,15 +570,18 @@ describe("MCP request handling", () => {
     assert.ok(Array.isArray(result.tools));
     const toolNames = result.tools.map((tool) => tool.name);
     assert.ok(toolNames.includes("compare_design"));
-    assert.strictEqual(result.version, "0.6.0");
+    assert.strictEqual(result.version, "0.7.0");
   });
 
-  test("exposes resize_fit and ignore_regions in the tool schema", async () => {
+  test("exposes resize_fit, ignore_regions, and the v0.7.0 params in the tool schema", async () => {
     const { handleListToolsRequest } = await import("./index.js");
     const result = await handleListToolsRequest();
     const schema = result.tools[0].inputSchema.properties as Record<string, unknown>;
     assert.ok(schema.resize_fit);
     assert.ok(schema.ignore_regions);
+    assert.ok(schema.svg_density);
+    assert.ok(schema.localize);
+    assert.ok(schema.max_difference_percentage);
   });
 
   test("should return image content when no output path provided", async () => {

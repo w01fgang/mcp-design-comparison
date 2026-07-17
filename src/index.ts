@@ -32,7 +32,7 @@ export type {
   HeatGrid,
 } from "./compare.js";
 
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 
 const RESIZE_FITS: ResizeFit[] = ["fill", "contain", "cover"];
 
@@ -71,17 +71,17 @@ export async function handleListToolsRequest() {
       {
         name: "compare_design",
         description:
-          "Compare a design screenshot with an implementation screenshot using pixelmatch and SSIM. Supports PNG, JPEG, WebP, GIF, and TIFF formats. Returns the number and percentage of different pixels, a structural-similarity (SSIM) score, and optionally outputs a diff image highlighting the differences.",
+          "Compare a design screenshot with an implementation screenshot using pixelmatch and SSIM. Supports PNG, JPEG, WebP, GIF, TIFF, and SVG inputs (SVGs are rasterized at svg_density). Returns the number and percentage of different pixels, a structural-similarity (SSIM) score, a diff bounding box and heat grid showing where differences cluster, and optionally outputs a diff image highlighting the differences.",
         inputSchema: {
           type: "object",
           properties: {
             design_path: {
               type: "string",
-              description: "Path to the design screenshot (supports PNG, JPEG, WebP, GIF, TIFF)",
+              description: "Path to the design screenshot (supports PNG, JPEG, WebP, GIF, TIFF, SVG)",
             },
             implementation_path: {
               type: "string",
-              description: "Path to the implementation screenshot (supports PNG, JPEG, WebP, GIF, TIFF)",
+              description: "Path to the implementation screenshot (supports PNG, JPEG, WebP, GIF, TIFF, SVG)",
             },
             output_diff_path: {
               type: "string",
