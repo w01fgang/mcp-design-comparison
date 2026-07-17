@@ -1407,3 +1407,206 @@ describe("SVG loading", () => {
     await fs.unlink(bogus);
   });
 });
+
+describe("SVG comparison", () => {
+  test("SVG design + PNG impl: reference dims are intrinsic x density/72", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-design.svg");
+    const impl = path.join(__dirname, "../test-fixtures/svg-design-impl.png");
+    await createTestSVG(SVG_RED_36, svgPath);
+    await createTestPNG(144, 144, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    const r = await expectOk(compareScreenshots(svgPath, impl)); // default density 288
+    assert.strictEqual(r.totalPixels, 144 * 144);
+    assert.strictEqual(r.differentPixels, 0);
+    assert.strictEqual(r.resized, undefined);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+
+  test("PNG design + SVG impl with matching intrinsic dims: no resized record, zero diff", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/svg-impl-design.png");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-impl.svg");
+    await createTestPNG(36, 36, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestSVG(SVG_RED_36, svgPath);
+
+    const r = await expectOk(compareScreenshots(design, svgPath));
+    assert.strictEqual(r.totalPixels, 36 * 36);
+    assert.strictEqual(r.differentPixels, 0);
+    // intrinsic dims match the design → not reported as a resize, even though
+    // the render happened at 288 dpi and was scaled down
+    assert.strictEqual(r.resized, undefined);
+
+    await fs.unlink(design);
+    await fs.unlink(svgPath);
+  });
+
+  test("SVG impl reports resized from its intrinsic (72 dpi) size", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/svg-resized-design.png");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-resized.svg");
+    await createTestPNG(72, 72, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestSVG(SVG_RED_36, svgPath);
+
+    const r = await expectOk(compareScreenshots(design, svgPath));
+    assert.deepStrictEqual(r.resized, {
+      fromWidth: 36,
+      fromHeight: 36,
+      toWidth: 72,
+      toHeight: 72,
+      fit: "contain",
+    });
+    assert.strictEqual(r.differentPixels, 0);
+
+    await fs.unlink(design);
+    await fs.unlink(svgPath);
+  });
+
+  test("auto_resize=false with an SVG impl errors on intrinsic-vs-design mismatch", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/svg-noresize-design.png");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-noresize.svg");
+    await createTestPNG(72, 72, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestSVG(SVG_RED_36, svgPath);
+
+    const r = await compareScreenshots(design, svgPath, undefined, 0.1, false);
+    assert.strictEqual(r.success, false);
+    assert.match(
+      r.error.message,
+      /Image dimensions don't match: design \(72x72\) vs implementation \(36x36\)/
+    );
+
+    await fs.unlink(design);
+    await fs.unlink(svgPath);
+  });
+
+  test("identical SVG on both sides → 0 diffs, diffBounds null, exact reference dims", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const a = path.join(__dirname, "../test-fixtures/svg-both-a.svg");
+    const b = path.join(__dirname, "../test-fixtures/svg-both-b.svg");
+    await createTestSVG(SVG_RED_36, a);
+    await createTestSVG(SVG_RED_36, b);
+
+    const r = await expectOk(compareScreenshots(a, b));
+    assert.strictEqual(r.totalPixels, 144 * 144); // 36x36 @ 288 → 144x144
+    assert.strictEqual(r.differentPixels, 0);
+    assert.strictEqual(r.diffBounds, null);
+
+    await fs.unlink(a);
+    await fs.unlink(b);
+  });
+
+  test("viewBox-only SVG resolves dims from viewBox", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-viewbox.svg");
+    const impl = path.join(__dirname, "../test-fixtures/svg-viewbox-impl.png");
+    await createTestSVG(SVG_VIEWBOX_ONLY, svgPath);
+    await createTestPNG(144, 144, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    const r = await expectOk(compareScreenshots(svgPath, impl));
+    assert.strictEqual(r.totalPixels, 144 * 144);
+    assert.strictEqual(r.differentPixels, 0);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+
+  test("SVG with no derivable intrinsic size fails loud as design and as impl", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const noSize = path.join(__dirname, "../test-fixtures/svg-nosize.svg");
+    const png = path.join(__dirname, "../test-fixtures/svg-nosize-peer.png");
+    await createTestSVG(SVG_NO_SIZE, noSize);
+    await createTestPNG(36, 36, { r: 1, g: 2, b: 3, a: 255 }, png);
+
+    const asDesign = await compareScreenshots(noSize, png);
+    assert.strictEqual(asDesign.success, false);
+    assert.match(asDesign.error.message, /no derivable intrinsic size/);
+
+    const asImpl = await compareScreenshots(png, noSize);
+    assert.strictEqual(asImpl.success, false);
+    assert.match(asImpl.error.message, /no derivable intrinsic size/);
+
+    await fs.unlink(noSize);
+    await fs.unlink(png);
+  });
+
+  test(".svg extension with non-SVG bytes fails through the format-error path", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/svg-bogus-design.png");
+    const bogus = path.join(__dirname, "../test-fixtures/svg-bogus.svg");
+    await createTestPNG(36, 36, { r: 1, g: 2, b: 3, a: 255 }, design);
+    await fs.writeFile(bogus, "this is not an svg");
+
+    const r = await compareScreenshots(design, bogus);
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /Unsupported image format/);
+
+    await fs.unlink(design);
+    await fs.unlink(bogus);
+  });
+
+  test("higher svg_density does not increase diff % on an AA-heavy shape", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/density-circle.svg");
+    const design = path.join(__dirname, "../test-fixtures/density-design.png");
+    await createTestSVG(SVG_CIRCLE_36, svgPath);
+    // Clean 72x72 reference: render the same circle at very high density and
+    // downscale — generated in-test on this platform, so no cross-platform
+    // golden flakiness; the assertion below is relational.
+    const ref = await sharp(Buffer.from(SVG_CIRCLE_36), { density: 1152 })
+      .resize(72, 72)
+      .png()
+      .toBuffer();
+    await fs.mkdir(path.dirname(design), { recursive: true });
+    await fs.writeFile(design, ref);
+
+    // svg_density 72 floors up to the effective ceil(72 * 72/36) = 144
+    const low = await expectOk(
+      compareScreenshots(design, svgPath, undefined, 0.1, true, "contain", [], true, 72)
+    );
+    const high = await expectOk(
+      compareScreenshots(design, svgPath, undefined, 0.1, true, "contain", [], true, 576)
+    );
+    assert.ok(high.differencePercentage <= low.differencePercentage + 0.5);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(design);
+  });
+
+  test("invalid svg_density fails loud even for raster-only inputs", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/svg-badden-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/svg-badden-impl.png");
+    await createTestPNG(8, 8, { r: 1, g: 1, b: 1, a: 255 }, design);
+    await createTestPNG(8, 8, { r: 1, g: 1, b: 1, a: 255 }, impl);
+
+    const r = await compareScreenshots(
+      design, impl, undefined, 0.1, true, "contain", [], true, -5
+    );
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /svg_density must be a positive, finite number/);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("bounds-checks unbounded render cost (huge density fails loud)", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-huge.svg");
+    const impl = path.join(__dirname, "../test-fixtures/svg-huge-impl.png");
+    await createTestSVG(SVG_RED_36, svgPath);
+    await createTestPNG(36, 36, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    // 36 * 1e7/72 = 5,000,000 px per side — far past the 8192x8192 cap
+    const r = await compareScreenshots(
+      svgPath, impl, undefined, 0.1, true, "contain", [], true, 1e7
+    );
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /svg_density too high/);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+});

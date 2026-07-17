@@ -105,6 +105,39 @@ function checkSvgRenderCost(
   return { success: true, value: undefined };
 }
 
+// Intrinsic-size pre-check for SVG inputs. librsvg's behaviour for a root
+// <svg> with neither width/height nor viewBox varies across versions (some
+// throw in metadata(), some invent a default viewport), so the
+// no-derivable-size case is detected deterministically here — and this check
+// must run BEFORE probeDimensions on every SVG path, so the clear
+// "no derivable intrinsic size" cause wins regardless of librsvg behaviour.
+// Presence-only check: value interpretation (px/pt/mm/%) defers to librsvg.
+// Non-SVG bytes pass through so sharp reports the real decode error with its
+// cause; a missing file keeps the "File not found" convention via checkExists.
+async function checkSvgIntrinsicSize(filePath: string): Promise<TryResult<void>> {
+  const exists = await checkExists(filePath);
+  if (!exists.success) {
+    return exists;
+  }
+  const read = await new Try(() => fs.readFile(filePath, "utf8")).result();
+  if (!read.success) {
+    return fail(`Unsupported image format: ${filePath} (${read.error.message})`);
+  }
+  const rootTag = /<svg\b[^>]*>/i.exec(read.value);
+  if (!rootTag) {
+    return { success: true, value: undefined }; // not an SVG root — let sharp report it
+  }
+  const hasWidthHeight =
+    /\bwidth\s*=/i.test(rootTag[0]) && /\bheight\s*=/i.test(rootTag[0]);
+  const hasViewBox = /\bviewBox\s*=/i.test(rootTag[0]);
+  if (!hasWidthHeight && !hasViewBox) {
+    return fail(
+      `Unsupported image format: ${filePath} (SVG has no derivable intrinsic size: no width/height attributes and no viewBox)`
+    );
+  }
+  return { success: true, value: undefined };
+}
+
 // Existence check shared by loadPNG and probeDimensions: maps a missing file to
 // a "File not found" failure (no-throw).
 async function checkExists(filePath: string): Promise<TryResult<void>> {
@@ -355,20 +388,68 @@ export async function compareScreenshots(
   autoResize: boolean = true,
   resizeFit: ResizeFit = "contain",
   ignoreRegions: IgnoreRegion[] = [],
-  localize: boolean = true
+  localize: boolean = true,
+  svgDensity: unknown = undefined
 ): Promise<TryResult<CompareResult>> {
   const normThreshold = normalizeThreshold(threshold);
 
+  // Density is validated up front (even for raster-only calls) so a malformed
+  // svg_density always fails loud instead of depending on the input mix.
+  const densityR = normalizeDensity(svgDensity);
+  if (!densityR.success) {
+    return densityR;
+  }
+  const density = densityR.value;
+
   // The design is the reference — always decoded in full at its native size.
-  const designR = await loadPNG(designPath);
+  // For an SVG design, "native size" is intrinsic x (density / 72): the render
+  // density defines the reference (design-space) dimensions, in which
+  // diffBounds, heatGrid, and ignore_regions are all expressed.
+  const designIsSvg = isSvgPath(designPath);
+  if (designIsSvg) {
+    // Intrinsic-size pre-check runs FIRST: on some librsvg builds metadata()
+    // throws for a dimensionless SVG, and the probe would then emit a generic
+    // format error instead of the "no derivable intrinsic size" cause.
+    const intrinsic = await checkSvgIntrinsicSize(designPath);
+    if (!intrinsic.success) {
+      return intrinsic;
+    }
+    const designProbe = await probeDimensions(designPath); // intrinsic, 72 dpi metadata
+    if (!designProbe.success) {
+      return designProbe;
+    }
+    const cost = checkSvgRenderCost(
+      designProbe.value.width,
+      designProbe.value.height,
+      density,
+      designPath
+    );
+    if (!cost.success) {
+      return cost;
+    }
+  }
+  const designR = await loadPNG(designPath, undefined, designIsSvg ? density : undefined);
   if (!designR.success) {
     return designR;
   }
   const design = designR.value;
 
+  const implIsSvg = isSvgPath(implementationPath);
+  if (implIsSvg) {
+    // Like the design path, the intrinsic check must precede probeDimensions
+    // so the "no derivable intrinsic size" cause wins even on librsvg builds
+    // whose metadata() throws for dimensionless SVGs.
+    const intrinsic = await checkSvgIntrinsicSize(implementationPath);
+    if (!intrinsic.success) {
+      return intrinsic;
+    }
+  }
+
   // Probe the implementation's dimensions (header only) before decoding, so a
   // resize decodes it once at the target size rather than decoding at native
-  // size and discarding that buffer.
+  // size and discarding that buffer. An SVG impl probes at its intrinsic size
+  // (72 dpi plain metadata), so the auto_resize:false mismatch check and
+  // resized.fromWidth/fromHeight stay intrinsic-based, exactly like rasters.
   const probe = await probeDimensions(implementationPath);
   if (!probe.success) {
     return probe;
@@ -391,12 +472,34 @@ export async function compareScreenshots(
     };
   }
   // Derive the resize target from the (single) resized record so the two never
-  // drift apart.
+  // drift apart. An SVG impl always renders to the design dims — even when its
+  // intrinsic dims already match — by rendering at an effective density >= the
+  // target and letting the existing resize path scale DOWN (never render small
+  // then upscale).
   const resizeTo = resized
     ? { width: resized.toWidth, height: resized.toHeight, fit: resized.fit }
-    : undefined;
+    : implIsSvg
+      ? { width: design.width, height: design.height, fit: resizeFit }
+      : undefined;
 
-  const implR = await loadPNG(implementationPath, resizeTo);
+  let implDensity: number | undefined;
+  if (implIsSvg && resizeTo) {
+    // svg_density is a floor/override, not the sole knob: the ceil() term
+    // guarantees the vector render is never smaller than the target.
+    const effectiveDensity = Math.max(
+      density,
+      Math.ceil(
+        72 * Math.max(resizeTo.width / implWidth, resizeTo.height / implHeight)
+      )
+    );
+    const cost = checkSvgRenderCost(implWidth, implHeight, effectiveDensity, implementationPath);
+    if (!cost.success) {
+      return cost;
+    }
+    implDensity = effectiveDensity;
+  }
+
+  const implR = await loadPNG(implementationPath, resizeTo, implDensity);
   if (!implR.success) {
     return implR;
   }
