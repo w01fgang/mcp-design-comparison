@@ -126,6 +126,12 @@ export async function handleListToolsRequest() {
               description:
                 "If set and the difference percentage exceeds it, the call returns an error (isError: true). Use as a CI gate against a golden image. Omit for report-only.",
             },
+            localize: {
+              type: "boolean",
+              description:
+                "If true (default), include a diff bounding box and a coarse per-cell heat grid in the result, showing where differences cluster. Set false to skip the extra pass.",
+              default: true,
+            },
           },
           required: ["design_path", "implementation_path"],
         },
@@ -157,6 +163,7 @@ export async function handleCallToolRequest(
       resize_fit?: string;
       ignore_regions?: unknown;
       max_difference_percentage?: unknown;
+      localize?: boolean;
     };
     const {
       design_path,
@@ -167,6 +174,7 @@ export async function handleCallToolRequest(
       resize_fit,
       ignore_regions,
       max_difference_percentage,
+      localize = true,
     } = args;
     if (typeof design_path !== "string" || typeof implementation_path !== "string") {
       return errorResponse("design_path and implementation_path are required");
@@ -204,7 +212,8 @@ export async function handleCallToolRequest(
       threshold,
       auto_resize,
       resizeFit,
-      ignoreRegions
+      ignoreRegions,
+      localize
     );
 
     if (!result.success) {
@@ -225,6 +234,20 @@ export async function handleCallToolRequest(
     }
     if (value.maskedPixels) {
       responseText += `Masked Pixels: ${value.maskedPixels.toLocaleString()} (excluded from comparison)\n`;
+    }
+
+    // Bounds/heat lines only when localize is on AND diffs exist (diffBounds
+    // non-null); zero-diff runs and localize=false print nothing extra.
+    if (value.diffBounds && value.heatGrid) {
+      responseText += `\nDiff bounds: x=${value.diffBounds.x} y=${value.diffBounds.y} w=${value.diffBounds.width} h=${value.diffBounds.height} (design space)\n`;
+      responseText += `Heat (${value.heatGrid.rows}x${value.heatGrid.cols}, % diff):\n`;
+      for (let row = 0; row < value.heatGrid.rows; row++) {
+        const cells = value.heatGrid.cells.slice(
+          row * value.heatGrid.cols,
+          (row + 1) * value.heatGrid.cols
+        );
+        responseText += `  ${cells.map((v) => Math.round(v).toString().padStart(3, " ")).join(" ")}\n`;
+      }
     }
 
     if (value.resized) {

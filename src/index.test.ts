@@ -1249,3 +1249,76 @@ describe("diff localization", () => {
     await fs.unlink(impl);
   });
 });
+
+describe("diff localization text output", () => {
+  test("appends Diff bounds and heat lines when diffs exist", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-text-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-text-impl.png");
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl },
+      },
+    });
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(textItem.text.includes("Diff bounds: x=0 y=0 w=10 h=10 (design space)"));
+    assert.ok(textItem.text.includes("Heat (3x3, % diff):"));
+    // full 100% diff → every heat row renders as "  100 100 100"
+    assert.ok(textItem.text.includes("  100 100 100"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("prints no bounds/heat lines on a zero-diff run", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-text0-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-text0-impl.png");
+    await createTestPNG(10, 10, { r: 5, g: 6, b: 7, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 5, g: 6, b: 7, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl },
+      },
+    });
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(!textItem.text.includes("Diff bounds:"));
+    assert.ok(!textItem.text.includes("Heat ("));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("prints no bounds/heat lines when localize is false", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-textoff-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-textoff-impl.png");
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, localize: false },
+      },
+    });
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(!textItem.text.includes("Diff bounds:"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("exposes localize in the tool schema", async () => {
+    const { handleListToolsRequest } = await import("./index.js");
+    const result = await handleListToolsRequest();
+    const schema = result.tools[0].inputSchema.properties as Record<string, unknown>;
+    assert.ok(schema.localize);
+  });
+});
