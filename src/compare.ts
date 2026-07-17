@@ -60,6 +60,51 @@ export function normalizeThreshold(t: unknown): number {
   return Math.max(0, Math.min(1, n));
 }
 
+// SVG rendering cost ceiling: refuse renders past 8192x8192 output pixels so a
+// huge viewBox x density combination fails loud instead of attempting the
+// render (and hitting sharp's opaque limitInputPixels failure).
+const MAX_SVG_OUTPUT_PIXELS = 8192 * 8192;
+
+// SVG inputs are detected by file extension only; content errors surface from
+// sharp as "Unsupported image format" with the underlying cause.
+function isSvgPath(filePath: string): boolean {
+  return filePath.toLowerCase().endsWith(".svg");
+}
+
+/**
+ * Validate svg_density: undefined → default 288 (renders a 36x36 icon at
+ * 144x144); anything else must be a positive, finite number. Fail-loud
+ * (TryResult), matching the ignore_regions convention — never let sharp throw
+ * an opaque error over a bad density.
+ */
+export function normalizeDensity(d: unknown): TryResult<number> {
+  if (d === undefined) {
+    return { success: true, value: 288 };
+  }
+  if (typeof d !== "number" || !Number.isFinite(d) || d <= 0) {
+    return fail("svg_density must be a positive, finite number");
+  }
+  return { success: true, value: d };
+}
+
+// Bounds-check the raster a density would produce for an SVG's intrinsic size,
+// so unbounded-cost renders fail loud before sharp attempts them.
+function checkSvgRenderCost(
+  intrinsicWidth: number,
+  intrinsicHeight: number,
+  density: number,
+  filePath: string
+): TryResult<void> {
+  const outWidth = Math.ceil((intrinsicWidth * density) / 72);
+  const outHeight = Math.ceil((intrinsicHeight * density) / 72);
+  if (outWidth * outHeight > MAX_SVG_OUTPUT_PIXELS) {
+    return fail(
+      `svg_density too high: rendering ${filePath} at ${density} dpi would produce ${outWidth}x${outHeight} pixels (limit ${MAX_SVG_OUTPUT_PIXELS})`
+    );
+  }
+  return { success: true, value: undefined };
+}
+
 // Existence check shared by loadPNG and probeDimensions: maps a missing file to
 // a "File not found" failure (no-throw).
 async function checkExists(filePath: string): Promise<TryResult<void>> {
@@ -78,7 +123,8 @@ async function checkExists(filePath: string): Promise<TryResult<void>> {
  */
 export async function loadPNG(
   filePath: string,
-  resizeTo?: { width: number; height: number; fit: ResizeFit }
+  resizeTo?: { width: number; height: number; fit: ResizeFit },
+  svgDensity?: number
 ): Promise<TryResult<PNG>> {
   const exists = await checkExists(filePath);
   if (!exists.success) {
@@ -88,7 +134,13 @@ export async function loadPNG(
   // Decode (and optional resize) in one pass; capturing the real error here is
   // what distinguishes a genuine format problem from a swallowed cause.
   const decoded = await new Try(() => {
-    let pipeline = sharp(filePath).ensureAlpha(); // RGBA
+    // SVG branch: density is a sharp *constructor* option (not chainable) that
+    // sets the librsvg rasterization DPI — output pixels = intrinsic size x
+    // (density / 72). The rest of the pipeline is shared with rasters.
+    const density = isSvgPath(filePath) ? svgDensity : undefined;
+    let pipeline = (
+      density !== undefined ? sharp(filePath, { density }) : sharp(filePath)
+    ).ensureAlpha(); // RGBA
     if (resizeTo) {
       // `fit` controls scaling when reconciling dimensions:
       //   contain — preserve aspect, letterbox the remainder (transparent pad)
@@ -126,7 +178,11 @@ async function probeDimensions(
   if (!meta.success) {
     return fail(`Unsupported image format: ${filePath} (${meta.error.message})`);
   }
-  return { success: true, value: { width: meta.value.width!, height: meta.value.height! } };
+  const { width, height } = meta.value;
+  if (!width || !height) {
+    return fail(`Unsupported image format: ${filePath} (no derivable intrinsic size)`);
+  }
+  return { success: true, value: { width, height } };
 }
 
 /**

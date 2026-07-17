@@ -83,6 +83,22 @@ async function createQuadrantPair(
   await fs.writeFile(impl, PNG.sync.write(i));
 }
 
+// In-test SVG fixtures (no committed golden rasters — librsvg renders vary
+// across platforms; all assertions below are relational).
+const SVG_RED_36 =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36"><rect width="36" height="36" fill="#ff0000"/></svg>';
+const SVG_VIEWBOX_ONLY =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36"><rect width="36" height="36" fill="#ff0000"/></svg>';
+const SVG_NO_SIZE =
+  '<svg xmlns="http://www.w3.org/2000/svg"><rect width="36" height="36" fill="#ff0000"/></svg>';
+const SVG_CIRCLE_36 =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36"><rect width="36" height="36" fill="#ffffff"/><circle cx="18" cy="18" r="14" fill="#000000"/></svg>';
+
+async function createTestSVG(svg: string, filePath: string): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, svg);
+}
+
 // Assert a TryResult succeeded and return its value (no-throw API helper).
 async function expectOk(promise: Promise<any>): Promise<any> {
   const r = await promise;
@@ -1320,5 +1336,74 @@ describe("diff localization text output", () => {
     const result = await handleListToolsRequest();
     const schema = result.tools[0].inputSchema.properties as Record<string, unknown>;
     assert.ok(schema.localize);
+  });
+});
+
+describe("normalizeDensity", () => {
+  test("defaults undefined to 288 and passes valid numbers through", async () => {
+    const { normalizeDensity } = await import("./index.js");
+    const def = normalizeDensity(undefined);
+    assert.strictEqual(def.success, true);
+    assert.strictEqual(def.value, 288);
+    const explicit = normalizeDensity(144);
+    assert.strictEqual(explicit.success, true);
+    assert.strictEqual(explicit.value, 144);
+  });
+
+  test("fails loud on non-number, NaN, zero, and negative", async () => {
+    const { normalizeDensity } = await import("./index.js");
+    for (const bad of ["288", 0, -1, NaN, null, {}]) {
+      const r = normalizeDensity(bad);
+      assert.strictEqual(r.success, false, `expected failure for ${String(bad)}`);
+      assert.match(r.error.message, /svg_density must be a positive, finite number/);
+    }
+  });
+});
+
+describe("SVG loading", () => {
+  test("renders an SVG at the given density (intrinsic x density/72)", async () => {
+    const { loadPNG } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/load-density.svg");
+    await createTestSVG(SVG_RED_36, svgPath);
+
+    const at288 = await expectOk(loadPNG(svgPath, undefined, 288));
+    assert.strictEqual(at288.width, 144); // 36 * 288/72
+    assert.strictEqual(at288.height, 144);
+    // solid full-bleed rect → first pixel is opaque red
+    assert.strictEqual(at288.data[0], 255);
+    assert.strictEqual(at288.data[3], 255);
+
+    const at72 = await expectOk(loadPNG(svgPath, undefined, 72));
+    assert.strictEqual(at72.width, 36);
+    assert.strictEqual(at72.height, 36);
+
+    await fs.unlink(svgPath);
+  });
+
+  test("resolves intrinsic size from viewBox when width/height are absent", async () => {
+    const { loadPNG } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/load-viewbox.svg");
+    await createTestSVG(SVG_VIEWBOX_ONLY, svgPath);
+
+    const png = await expectOk(loadPNG(svgPath, undefined, 288));
+    assert.strictEqual(png.width, 144);
+    assert.strictEqual(png.height, 144);
+
+    await fs.unlink(svgPath);
+  });
+
+  test("reports unsupported for .svg files with non-SVG bytes (cause preserved)", async () => {
+    const { loadPNG } = await import("./index.js");
+    const bogus = path.join(__dirname, "../test-fixtures/bogus.svg");
+    await fs.mkdir(path.dirname(bogus), { recursive: true });
+    await fs.writeFile(bogus, "this is not an svg");
+
+    const r = await loadPNG(bogus, undefined, 288);
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /Unsupported image format/);
+    // the underlying cause is preserved, not swallowed
+    assert.ok(r.error.message.length > "Unsupported image format: ".length + bogus.length);
+
+    await fs.unlink(bogus);
   });
 });

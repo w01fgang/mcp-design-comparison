@@ -20,6 +20,7 @@ export {
   computeSSIM,
   buildMask,
   normalizeThreshold,
+  normalizeDensity,
   localizeDiff,
 } from "./compare.js";
 export type {
