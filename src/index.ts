@@ -113,6 +113,11 @@ export async function handleListToolsRequest() {
                 required: ["x", "y", "width", "height"],
               },
             },
+            max_difference_percentage: {
+              type: "number",
+              description:
+                "If set and the difference percentage exceeds it, the call returns an error (isError: true). Use as a CI gate against a golden image. Omit for report-only.",
+            },
           },
           required: ["design_path", "implementation_path"],
         },
@@ -143,6 +148,7 @@ export async function handleCallToolRequest(
       auto_resize?: boolean;
       resize_fit?: string;
       ignore_regions?: unknown;
+      max_difference_percentage?: unknown;
     };
     const {
       design_path,
@@ -152,9 +158,23 @@ export async function handleCallToolRequest(
       auto_resize = true,
       resize_fit,
       ignore_regions,
+      max_difference_percentage,
     } = args;
     if (typeof design_path !== "string" || typeof implementation_path !== "string") {
       return errorResponse("design_path and implementation_path are required");
+    }
+
+    // Validate the gate before any decode: a malformed gate must fail loud, not
+    // silently degrade into a report-only run (mirrors the ignore_regions rule).
+    if (
+      max_difference_percentage !== undefined &&
+      (typeof max_difference_percentage !== "number" ||
+        !Number.isFinite(max_difference_percentage) ||
+        max_difference_percentage < 0)
+    ) {
+      return errorResponse(
+        "max_difference_percentage must be a non-negative, finite number"
+      );
     }
 
     const resizeFit = normalizeResizeFit(resize_fit);
@@ -221,6 +241,20 @@ export async function handleCallToolRequest(
         data: value.diffImageBase64,
         mimeType: "image/png",
       });
+    }
+
+    // Assertion gate: strictly greater-than trips; equality passes. Applied
+    // after the diff artifact exists (file already written / base64 already in
+    // content) so a failing CI log keeps the same diagnostics as a passing run.
+    if (
+      typeof max_difference_percentage === "number" &&
+      value.differencePercentage > max_difference_percentage
+    ) {
+      content[0] = {
+        type: "text",
+        text: `Difference ${value.differencePercentage.toFixed(2)}% exceeds max_difference_percentage ${max_difference_percentage}%\n\n${responseText}`,
+      };
+      return { content, isError: true };
     }
 
     return { content };

@@ -861,3 +861,161 @@ describe("MCP request handling", () => {
     );
   });
 });
+
+describe("max_difference_percentage gate", () => {
+  test("passes when the difference is below the gate", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-below-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-below-impl.png");
+    await createTestPNG(10, 10, { r: 100, g: 150, b: 200, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 100, g: 150, b: 200, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, max_difference_percentage: 5 },
+      },
+    });
+    assert.strictEqual(res.isError, undefined);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("passes on exact equality (strictly-greater boundary)", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-eq-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-eq-impl.png");
+    // full red vs full blue → exactly 100.00% different; a gate of 100 must pass
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, max_difference_percentage: 100 },
+      },
+    });
+    assert.strictEqual(res.isError, undefined);
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(textItem.text.includes("Difference: 100.00%"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("trips with a distinct message naming both numbers (artifact kept, base64 mode)", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-trip-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-trip-impl.png");
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, max_difference_percentage: 5 },
+      },
+    });
+    assert.strictEqual(res.isError, true);
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(
+      textItem.text.startsWith("Difference 100.00% exceeds max_difference_percentage 5%")
+    );
+    assert.ok(!textItem.text.startsWith("Error comparing screenshots"));
+    // full stats survive into the gate-trip error
+    assert.ok(textItem.text.includes("Total Pixels:"));
+    assert.ok(textItem.text.includes("SSIM:"));
+    // diff artifact survives (base64 output mode)
+    assert.ok(res.content.some((c: any) => c.type === "image"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("gate of 0 with a zero diff passes", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-zero-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-zero-impl.png");
+    await createTestPNG(8, 8, { r: 20, g: 30, b: 40, a: 255 }, design);
+    await createTestPNG(8, 8, { r: 20, g: 30, b: 40, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, max_difference_percentage: 0 },
+      },
+    });
+    assert.strictEqual(res.isError, undefined);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("rejects invalid values (negative, NaN) before any comparison runs", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    // paths deliberately non-existent: validation must fail loud before any decode
+    const negative = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: "/non/existent/a.png",
+          implementation_path: "/non/existent/b.png",
+          max_difference_percentage: -1,
+        },
+      },
+    });
+    assert.strictEqual(negative.isError, true);
+    assert.ok(
+      negative.content[0].text.includes(
+        "max_difference_percentage must be a non-negative, finite number"
+      )
+    );
+
+    const nan = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: "/non/existent/a.png",
+          implementation_path: "/non/existent/b.png",
+          max_difference_percentage: NaN,
+        },
+      },
+    });
+    assert.strictEqual(nan.isError, true);
+    assert.ok(
+      nan.content[0].text.includes(
+        "max_difference_percentage must be a non-negative, finite number"
+      )
+    );
+  });
+
+  test("writes the diff file even when the gate trips (file mode)", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-file-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-file-impl.png");
+    const diff = path.join(__dirname, "../test-fixtures/gate-file-diff.png");
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: design,
+          implementation_path: impl,
+          output_diff_path: diff,
+          max_difference_percentage: 5,
+        },
+      },
+    });
+    assert.strictEqual(res.isError, true);
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(textItem.text.includes(`Diff image saved to: ${diff}`));
+    await fs.access(diff); // artifact written despite the trip
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+    await fs.unlink(diff);
+  });
+});
