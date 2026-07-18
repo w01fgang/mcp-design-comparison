@@ -20,10 +20,19 @@ export {
   computeSSIM,
   buildMask,
   normalizeThreshold,
+  normalizeDensity,
+  localizeDiff,
 } from "./compare.js";
-export type { CompareResult, ResizeFit, IgnoreRegion, TryResult } from "./compare.js";
+export type {
+  CompareResult,
+  ResizeFit,
+  IgnoreRegion,
+  TryResult,
+  DiffBounds,
+  HeatGrid,
+} from "./compare.js";
 
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 
 const RESIZE_FITS: ResizeFit[] = ["fill", "contain", "cover"];
 
@@ -62,17 +71,17 @@ export async function handleListToolsRequest() {
       {
         name: "compare_design",
         description:
-          "Compare a design screenshot with an implementation screenshot using pixelmatch and SSIM. Supports PNG, JPEG, WebP, GIF, and TIFF formats. Returns the number and percentage of different pixels, a structural-similarity (SSIM) score, and optionally outputs a diff image highlighting the differences.",
+          "Compare a design screenshot with an implementation screenshot using pixelmatch and SSIM. Supports PNG, JPEG, WebP, GIF, TIFF, and SVG inputs (SVGs are rasterized at svg_density). Returns the number and percentage of different pixels, a structural-similarity (SSIM) score, a diff bounding box and heat grid showing where differences cluster, and optionally outputs a diff image highlighting the differences.",
         inputSchema: {
           type: "object",
           properties: {
             design_path: {
               type: "string",
-              description: "Path to the design screenshot (supports PNG, JPEG, WebP, GIF, TIFF)",
+              description: "Path to the design screenshot (supports PNG, JPEG, WebP, GIF, TIFF, SVG)",
             },
             implementation_path: {
               type: "string",
-              description: "Path to the implementation screenshot (supports PNG, JPEG, WebP, GIF, TIFF)",
+              description: "Path to the implementation screenshot (supports PNG, JPEG, WebP, GIF, TIFF, SVG)",
             },
             output_diff_path: {
               type: "string",
@@ -113,6 +122,23 @@ export async function handleListToolsRequest() {
                 required: ["x", "y", "width", "height"],
               },
             },
+            max_difference_percentage: {
+              type: "number",
+              description:
+                "If set and the difference percentage exceeds it, the call returns an error (isError: true). Use as a CI gate against a golden image. Omit for report-only.",
+            },
+            localize: {
+              type: "boolean",
+              description:
+                "If true (default), include a diff bounding box and a coarse per-cell heat grid in the result, showing where differences cluster. Set false to skip the extra pass.",
+              default: true,
+            },
+            svg_density: {
+              type: "number",
+              description:
+                "Rasterization density (DPI) for SVG inputs. Higher = crisper vector render before comparison. Default 288 (4x the 72dpi baseline). Aimed at small assets (icons/logos); lower it for large vector art.",
+              default: 288,
+            },
           },
           required: ["design_path", "implementation_path"],
         },
@@ -143,6 +169,9 @@ export async function handleCallToolRequest(
       auto_resize?: boolean;
       resize_fit?: string;
       ignore_regions?: unknown;
+      max_difference_percentage?: unknown;
+      localize?: boolean;
+      svg_density?: unknown;
     };
     const {
       design_path,
@@ -152,9 +181,25 @@ export async function handleCallToolRequest(
       auto_resize = true,
       resize_fit,
       ignore_regions,
+      max_difference_percentage,
+      localize = true,
+      svg_density,
     } = args;
     if (typeof design_path !== "string" || typeof implementation_path !== "string") {
       return errorResponse("design_path and implementation_path are required");
+    }
+
+    // Validate the gate before any decode: a malformed gate must fail loud, not
+    // silently degrade into a report-only run (mirrors the ignore_regions rule).
+    if (
+      max_difference_percentage !== undefined &&
+      (typeof max_difference_percentage !== "number" ||
+        !Number.isFinite(max_difference_percentage) ||
+        max_difference_percentage < 0)
+    ) {
+      return errorResponse(
+        "max_difference_percentage must be a non-negative, finite number"
+      );
     }
 
     const resizeFit = normalizeResizeFit(resize_fit);
@@ -176,7 +221,9 @@ export async function handleCallToolRequest(
       threshold,
       auto_resize,
       resizeFit,
-      ignoreRegions
+      ignoreRegions,
+      localize,
+      svg_density
     );
 
     if (!result.success) {
@@ -197,6 +244,20 @@ export async function handleCallToolRequest(
     }
     if (value.maskedPixels) {
       responseText += `Masked Pixels: ${value.maskedPixels.toLocaleString()} (excluded from comparison)\n`;
+    }
+
+    // Bounds/heat lines only when localize is on AND diffs exist (diffBounds
+    // non-null); zero-diff runs and localize=false print nothing extra.
+    if (value.diffBounds && value.heatGrid) {
+      responseText += `\nDiff bounds: x=${value.diffBounds.x} y=${value.diffBounds.y} w=${value.diffBounds.width} h=${value.diffBounds.height} (design space)\n`;
+      responseText += `Heat (${value.heatGrid.rows}x${value.heatGrid.cols}, % diff):\n`;
+      for (let row = 0; row < value.heatGrid.rows; row++) {
+        const cells = value.heatGrid.cells.slice(
+          row * value.heatGrid.cols,
+          (row + 1) * value.heatGrid.cols
+        );
+        responseText += `  ${cells.map((v) => Math.round(v).toString().padStart(3, " ")).join(" ")}\n`;
+      }
     }
 
     if (value.resized) {
@@ -221,6 +282,20 @@ export async function handleCallToolRequest(
         data: value.diffImageBase64,
         mimeType: "image/png",
       });
+    }
+
+    // Assertion gate: strictly greater-than trips; equality passes. Applied
+    // after the diff artifact exists (file already written / base64 already in
+    // content) so a failing CI log keeps the same diagnostics as a passing run.
+    if (
+      typeof max_difference_percentage === "number" &&
+      value.differencePercentage > max_difference_percentage
+    ) {
+      content[0] = {
+        type: "text",
+        text: `Difference ${value.differencePercentage.toFixed(2)}% exceeds max_difference_percentage ${max_difference_percentage}%\n\n${responseText}`,
+      };
+      return { content, isError: true };
     }
 
     return { content };

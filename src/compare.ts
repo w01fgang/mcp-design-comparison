@@ -32,6 +32,10 @@ export interface CompareResult {
     toHeight: number;
     fit: ResizeFit;
   };
+  /** Bounding box of differing pixels in design space; null = zero differing pixels. Omitted when localize=false. */
+  diffBounds?: DiffBounds | null;
+  /** Coarse per-cell diff heat grid. Zero diffs → all-zero cells. Omitted when localize=false. */
+  heatGrid?: HeatGrid;
 }
 
 // Single failure-result factory for the no-throw API (the failure variant is
@@ -56,6 +60,84 @@ export function normalizeThreshold(t: unknown): number {
   return Math.max(0, Math.min(1, n));
 }
 
+// SVG rendering cost ceiling: refuse renders past 8192x8192 output pixels so a
+// huge viewBox x density combination fails loud instead of attempting the
+// render (and hitting sharp's opaque limitInputPixels failure).
+const MAX_SVG_OUTPUT_PIXELS = 8192 * 8192;
+
+// SVG inputs are detected by file extension only; content errors surface from
+// sharp as "Unsupported image format" with the underlying cause.
+function isSvgPath(filePath: string): boolean {
+  return filePath.toLowerCase().endsWith(".svg");
+}
+
+/**
+ * Validate svg_density: undefined → default 288 (renders a 36x36 icon at
+ * 144x144); anything else must be a positive, finite number. Fail-loud
+ * (TryResult), matching the ignore_regions convention — never let sharp throw
+ * an opaque error over a bad density.
+ */
+export function normalizeDensity(d: unknown): TryResult<number> {
+  if (d === undefined) {
+    return { success: true, value: 288 };
+  }
+  if (typeof d !== "number" || !Number.isFinite(d) || d <= 0) {
+    return fail("svg_density must be a positive, finite number");
+  }
+  return { success: true, value: d };
+}
+
+// Bounds-check the raster a density would produce for an SVG's intrinsic size,
+// so unbounded-cost renders fail loud before sharp attempts them.
+function checkSvgRenderCost(
+  intrinsicWidth: number,
+  intrinsicHeight: number,
+  density: number,
+  filePath: string
+): TryResult<void> {
+  const outWidth = Math.ceil((intrinsicWidth * density) / 72);
+  const outHeight = Math.ceil((intrinsicHeight * density) / 72);
+  if (outWidth * outHeight > MAX_SVG_OUTPUT_PIXELS) {
+    return fail(
+      `svg_density too high: rendering ${filePath} at ${density} dpi would produce ${outWidth}x${outHeight} pixels (limit ${MAX_SVG_OUTPUT_PIXELS})`
+    );
+  }
+  return { success: true, value: undefined };
+}
+
+// Intrinsic-size pre-check for SVG inputs. librsvg's behaviour for a root
+// <svg> with neither width/height nor viewBox varies across versions (some
+// throw in metadata(), some invent a default viewport), so the
+// no-derivable-size case is detected deterministically here — and this check
+// must run BEFORE probeDimensions on every SVG path, so the clear
+// "no derivable intrinsic size" cause wins regardless of librsvg behaviour.
+// Presence-only check: value interpretation (px/pt/mm/%) defers to librsvg.
+// Non-SVG bytes pass through so sharp reports the real decode error with its
+// cause; a missing file keeps the "File not found" convention via checkExists.
+async function checkSvgIntrinsicSize(filePath: string): Promise<TryResult<void>> {
+  const exists = await checkExists(filePath);
+  if (!exists.success) {
+    return exists;
+  }
+  const read = await new Try(() => fs.readFile(filePath, "utf8")).result();
+  if (!read.success) {
+    return fail(`Unsupported image format: ${filePath} (${read.error.message})`);
+  }
+  const rootTag = /<svg\b[^>]*>/i.exec(read.value);
+  if (!rootTag) {
+    return { success: true, value: undefined }; // not an SVG root — let sharp report it
+  }
+  const hasWidthHeight =
+    /\bwidth\s*=/i.test(rootTag[0]) && /\bheight\s*=/i.test(rootTag[0]);
+  const hasViewBox = /\bviewBox\s*=/i.test(rootTag[0]);
+  if (!hasWidthHeight && !hasViewBox) {
+    return fail(
+      `Unsupported image format: ${filePath} (SVG has no derivable intrinsic size: no width/height attributes and no viewBox)`
+    );
+  }
+  return { success: true, value: undefined };
+}
+
 // Existence check shared by loadPNG and probeDimensions: maps a missing file to
 // a "File not found" failure (no-throw).
 async function checkExists(filePath: string): Promise<TryResult<void>> {
@@ -74,7 +156,8 @@ async function checkExists(filePath: string): Promise<TryResult<void>> {
  */
 export async function loadPNG(
   filePath: string,
-  resizeTo?: { width: number; height: number; fit: ResizeFit }
+  resizeTo?: { width: number; height: number; fit: ResizeFit },
+  svgDensity?: number
 ): Promise<TryResult<PNG>> {
   const exists = await checkExists(filePath);
   if (!exists.success) {
@@ -84,7 +167,13 @@ export async function loadPNG(
   // Decode (and optional resize) in one pass; capturing the real error here is
   // what distinguishes a genuine format problem from a swallowed cause.
   const decoded = await new Try(() => {
-    let pipeline = sharp(filePath).ensureAlpha(); // RGBA
+    // SVG branch: density is a sharp *constructor* option (not chainable) that
+    // sets the librsvg rasterization DPI — output pixels = intrinsic size x
+    // (density / 72). The rest of the pipeline is shared with rasters.
+    const density = isSvgPath(filePath) ? svgDensity : undefined;
+    let pipeline = (
+      density !== undefined ? sharp(filePath, { density }) : sharp(filePath)
+    ).ensureAlpha(); // RGBA
     if (resizeTo) {
       // `fit` controls scaling when reconciling dimensions:
       //   contain — preserve aspect, letterbox the remainder (transparent pad)
@@ -122,7 +211,11 @@ async function probeDimensions(
   if (!meta.success) {
     return fail(`Unsupported image format: ${filePath} (${meta.error.message})`);
   }
-  return { success: true, value: { width: meta.value.width!, height: meta.value.height! } };
+  const { width, height } = meta.value;
+  if (!width || !height) {
+    return fail(`Unsupported image format: ${filePath} (no derivable intrinsic size)`);
+  }
+  return { success: true, value: { width, height } };
 }
 
 /**
@@ -207,6 +300,86 @@ export function computeSSIM(a: PNG, b: PNG): number {
   return ssim(toImageData(a), toImageData(b), { windowSize }).mssim;
 }
 
+export interface DiffBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface HeatGrid {
+  rows: number;
+  cols: number;
+  /** Row-major, per-cell % of that cell's unmasked pixels (0–100). */
+  cells: number[];
+}
+
+/**
+ * Locate pixelmatch differences: bounding box + coarse heat grid, in one
+ * O(W·H) pass over the diff buffer. A pixel counts as changed ⇔ its diff pixel
+ * equals pixelmatch's red marker (255, 0, 0, 255) — anti-aliased pixels
+ * (yellow) and unchanged pixels (grayscale) are excluded, so the population is
+ * exactly `differentPixels`. Masked pixels are skipped from each cell's
+ * denominator (and are painted grayscale, never red, so they cannot enter the
+ * numerator). Cell boundaries sit at floor(W/cols) / floor(H/rows); the last
+ * column/row absorbs the remainder, so every pixel is counted exactly once.
+ * Pure — does not throw for valid inputs, so it returns a plain value rather
+ * than a TryResult (mirrors computeSSIM).
+ */
+export function localizeDiff(
+  diffData: Buffer,
+  width: number,
+  height: number,
+  mask: Uint8Array,
+  rows: number = 3,
+  cols: number = 3
+): { diffBounds: DiffBounds | null; heatGrid: HeatGrid } {
+  // Math.max(1, ...) keeps the index math valid when the image is smaller than
+  // the grid (floor would yield 0 and divide by zero).
+  const cellW = Math.max(1, Math.floor(width / cols));
+  const cellH = Math.max(1, Math.floor(height / rows));
+
+  const diffCounts = new Array<number>(rows * cols).fill(0);
+  const unmaskedCounts = new Array<number>(rows * cols).fill(0);
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y++) {
+    const rowBase = y * width;
+    const gridRow = Math.min(rows - 1, Math.floor(y / cellH));
+    for (let x = 0; x < width; x++) {
+      const k = rowBase + x;
+      if (mask[k]) {
+        continue; // masked: excluded from both numerator and denominator
+      }
+      const cell = gridRow * cols + Math.min(cols - 1, Math.floor(x / cellW));
+      unmaskedCounts[cell]++;
+      const idx = k << 2;
+      if (
+        diffData[idx] === 255 &&
+        diffData[idx + 1] === 0 &&
+        diffData[idx + 2] === 0 &&
+        diffData[idx + 3] === 255
+      ) {
+        diffCounts[cell]++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  const diffBounds: DiffBounds | null =
+    maxX < 0 ? null : { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 };
+  const cells = diffCounts.map((count, i) =>
+    unmaskedCounts[i] > 0 ? (count / unmaskedCounts[i]) * 100 : 0
+  );
+  return { diffBounds, heatGrid: { rows, cols, cells } };
+}
+
 export async function compareScreenshots(
   designPath: string,
   implementationPath: string,
@@ -214,20 +387,69 @@ export async function compareScreenshots(
   threshold: unknown = 0.1,
   autoResize: boolean = true,
   resizeFit: ResizeFit = "contain",
-  ignoreRegions: IgnoreRegion[] = []
+  ignoreRegions: IgnoreRegion[] = [],
+  localize: boolean = true,
+  svgDensity: unknown = undefined
 ): Promise<TryResult<CompareResult>> {
   const normThreshold = normalizeThreshold(threshold);
 
+  // Density is validated up front (even for raster-only calls) so a malformed
+  // svg_density always fails loud instead of depending on the input mix.
+  const densityR = normalizeDensity(svgDensity);
+  if (!densityR.success) {
+    return densityR;
+  }
+  const density = densityR.value;
+
   // The design is the reference — always decoded in full at its native size.
-  const designR = await loadPNG(designPath);
+  // For an SVG design, "native size" is intrinsic x (density / 72): the render
+  // density defines the reference (design-space) dimensions, in which
+  // diffBounds, heatGrid, and ignore_regions are all expressed.
+  const designIsSvg = isSvgPath(designPath);
+  if (designIsSvg) {
+    // Intrinsic-size pre-check runs FIRST: on some librsvg builds metadata()
+    // throws for a dimensionless SVG, and the probe would then emit a generic
+    // format error instead of the "no derivable intrinsic size" cause.
+    const intrinsic = await checkSvgIntrinsicSize(designPath);
+    if (!intrinsic.success) {
+      return intrinsic;
+    }
+    const designProbe = await probeDimensions(designPath); // intrinsic, 72 dpi metadata
+    if (!designProbe.success) {
+      return designProbe;
+    }
+    const cost = checkSvgRenderCost(
+      designProbe.value.width,
+      designProbe.value.height,
+      density,
+      designPath
+    );
+    if (!cost.success) {
+      return cost;
+    }
+  }
+  const designR = await loadPNG(designPath, undefined, designIsSvg ? density : undefined);
   if (!designR.success) {
     return designR;
   }
   const design = designR.value;
 
+  const implIsSvg = isSvgPath(implementationPath);
+  if (implIsSvg) {
+    // Like the design path, the intrinsic check must precede probeDimensions
+    // so the "no derivable intrinsic size" cause wins even on librsvg builds
+    // whose metadata() throws for dimensionless SVGs.
+    const intrinsic = await checkSvgIntrinsicSize(implementationPath);
+    if (!intrinsic.success) {
+      return intrinsic;
+    }
+  }
+
   // Probe the implementation's dimensions (header only) before decoding, so a
   // resize decodes it once at the target size rather than decoding at native
-  // size and discarding that buffer.
+  // size and discarding that buffer. An SVG impl probes at its intrinsic size
+  // (72 dpi plain metadata), so the auto_resize:false mismatch check and
+  // resized.fromWidth/fromHeight stay intrinsic-based, exactly like rasters.
   const probe = await probeDimensions(implementationPath);
   if (!probe.success) {
     return probe;
@@ -250,12 +472,34 @@ export async function compareScreenshots(
     };
   }
   // Derive the resize target from the (single) resized record so the two never
-  // drift apart.
+  // drift apart. An SVG impl always renders to the design dims — even when its
+  // intrinsic dims already match — by rendering at an effective density >= the
+  // target and letting the existing resize path scale DOWN (never render small
+  // then upscale).
   const resizeTo = resized
     ? { width: resized.toWidth, height: resized.toHeight, fit: resized.fit }
-    : undefined;
+    : implIsSvg
+      ? { width: design.width, height: design.height, fit: resizeFit }
+      : undefined;
 
-  const implR = await loadPNG(implementationPath, resizeTo);
+  let implDensity: number | undefined;
+  if (implIsSvg && resizeTo) {
+    // svg_density is a floor/override, not the sole knob: the ceil() term
+    // guarantees the vector render is never smaller than the target.
+    const effectiveDensity = Math.max(
+      density,
+      Math.ceil(
+        72 * Math.max(resizeTo.width / implWidth, resizeTo.height / implHeight)
+      )
+    );
+    const cost = checkSvgRenderCost(implWidth, implHeight, effectiveDensity, implementationPath);
+    if (!cost.success) {
+      return cost;
+    }
+    implDensity = effectiveDensity;
+  }
+
+  const implR = await loadPNG(implementationPath, resizeTo, implDensity);
   if (!implR.success) {
     return implR;
   }
@@ -279,6 +523,10 @@ export async function compareScreenshots(
   return new Try(async () => {
     const diff = new PNG({ width: design.width, height: design.height });
 
+    // localizeDiff keys on pixelmatch's default red marker (255, 0, 0, 255).
+    // That invariant holds only while this call never passes diffColor,
+    // diffColorAlt, or diffMask — do not add those options without updating
+    // localizeDiff.
     const differentPixels = pixelmatch(
       design.data,
       implementation.data,
@@ -308,6 +556,12 @@ export async function compareScreenshots(
     }
     if (resized) {
       value.resized = resized;
+    }
+
+    if (localize) {
+      const localization = localizeDiff(diff.data, design.width, design.height, mask);
+      value.diffBounds = localization.diffBounds;
+      value.heatGrid = localization.heatGrid;
     }
 
     if (outputDiffPath) {

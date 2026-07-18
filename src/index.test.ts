@@ -57,6 +57,48 @@ async function createTruncatedPNG(filePath: string): Promise<void> {
   await fs.writeFile(filePath, buf.subarray(0, Math.floor(buf.length * 0.5)));
 }
 
+// design solid red; impl identical except a blue block at the given rect.
+// Deterministic with pixelmatch: solid blocks are never AA-classified, so
+// differentPixels equals the block area exactly (same precedent as the
+// exact-count assertions in the ignore_regions suite).
+async function createQuadrantPair(
+  design: string,
+  impl: string,
+  size: number,
+  block: { x: number; y: number; width: number; height: number }
+): Promise<void> {
+  await fs.mkdir(path.dirname(design), { recursive: true });
+  const d = new PNG({ width: size, height: size });
+  const i = new PNG({ width: size, height: size });
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const idx = (size * y + x) << 2;
+      d.data[idx] = 255; d.data[idx + 1] = 0; d.data[idx + 2] = 0; d.data[idx + 3] = 255;
+      const blue =
+        x >= block.x && x < block.x + block.width && y >= block.y && y < block.y + block.height;
+      i.data[idx] = blue ? 0 : 255; i.data[idx + 1] = 0; i.data[idx + 2] = blue ? 255 : 0; i.data[idx + 3] = 255;
+    }
+  }
+  await fs.writeFile(design, PNG.sync.write(d));
+  await fs.writeFile(impl, PNG.sync.write(i));
+}
+
+// In-test SVG fixtures (no committed golden rasters — librsvg renders vary
+// across platforms; all assertions below are relational).
+const SVG_RED_36 =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36"><rect width="36" height="36" fill="#ff0000"/></svg>';
+const SVG_VIEWBOX_ONLY =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36"><rect width="36" height="36" fill="#ff0000"/></svg>';
+const SVG_NO_SIZE =
+  '<svg xmlns="http://www.w3.org/2000/svg"><rect width="36" height="36" fill="#ff0000"/></svg>';
+const SVG_CIRCLE_36 =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36"><rect width="36" height="36" fill="#ffffff"/><circle cx="18" cy="18" r="14" fill="#000000"/></svg>';
+
+async function createTestSVG(svg: string, filePath: string): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, svg);
+}
+
 // Assert a TryResult succeeded and return its value (no-throw API helper).
 async function expectOk(promise: Promise<any>): Promise<any> {
   const r = await promise;
@@ -528,15 +570,18 @@ describe("MCP request handling", () => {
     assert.ok(Array.isArray(result.tools));
     const toolNames = result.tools.map((tool) => tool.name);
     assert.ok(toolNames.includes("compare_design"));
-    assert.strictEqual(result.version, "0.6.0");
+    assert.strictEqual(result.version, "0.7.0");
   });
 
-  test("exposes resize_fit and ignore_regions in the tool schema", async () => {
+  test("exposes resize_fit, ignore_regions, and the v0.7.0 params in the tool schema", async () => {
     const { handleListToolsRequest } = await import("./index.js");
     const result = await handleListToolsRequest();
     const schema = result.tools[0].inputSchema.properties as Record<string, unknown>;
     assert.ok(schema.resize_fit);
     assert.ok(schema.ignore_regions);
+    assert.ok(schema.svg_density);
+    assert.ok(schema.localize);
+    assert.ok(schema.max_difference_percentage);
   });
 
   test("should return image content when no output path provided", async () => {
@@ -859,5 +904,768 @@ describe("MCP request handling", () => {
       async () => await handleCallToolRequest({ params: { name: "nope", arguments: {} } }),
       /Unknown tool: nope/
     );
+  });
+});
+
+describe("max_difference_percentage gate", () => {
+  test("passes when the difference is below the gate", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-below-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-below-impl.png");
+    await createTestPNG(10, 10, { r: 100, g: 150, b: 200, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 100, g: 150, b: 200, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, max_difference_percentage: 5 },
+      },
+    });
+    assert.strictEqual(res.isError, undefined);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("passes on exact equality (strictly-greater boundary)", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-eq-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-eq-impl.png");
+    // full red vs full blue → exactly 100.00% different; a gate of 100 must pass
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, max_difference_percentage: 100 },
+      },
+    });
+    assert.strictEqual(res.isError, undefined);
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(textItem.text.includes("Difference: 100.00%"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("trips with a distinct message naming both numbers (artifact kept, base64 mode)", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-trip-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-trip-impl.png");
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, max_difference_percentage: 5 },
+      },
+    });
+    assert.strictEqual(res.isError, true);
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(
+      textItem.text.startsWith("Difference 100.00% exceeds max_difference_percentage 5%")
+    );
+    assert.ok(!textItem.text.startsWith("Error comparing screenshots"));
+    // full stats survive into the gate-trip error
+    assert.ok(textItem.text.includes("Total Pixels:"));
+    assert.ok(textItem.text.includes("SSIM:"));
+    // localization output survives into the gate-trip error too
+    assert.ok(textItem.text.includes("Diff bounds:"));
+    assert.ok(textItem.text.includes("Heat (3x3, % diff):"));
+    // diff artifact survives (base64 output mode)
+    assert.ok(res.content.some((c: any) => c.type === "image"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("gate of 0 with a zero diff passes", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-zero-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-zero-impl.png");
+    await createTestPNG(8, 8, { r: 20, g: 30, b: 40, a: 255 }, design);
+    await createTestPNG(8, 8, { r: 20, g: 30, b: 40, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, max_difference_percentage: 0 },
+      },
+    });
+    assert.strictEqual(res.isError, undefined);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("rejects invalid values (negative, NaN) before any comparison runs", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    // paths deliberately non-existent: validation must fail loud before any decode
+    const negative = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: "/non/existent/a.png",
+          implementation_path: "/non/existent/b.png",
+          max_difference_percentage: -1,
+        },
+      },
+    });
+    assert.strictEqual(negative.isError, true);
+    assert.ok(
+      negative.content[0].text.includes(
+        "max_difference_percentage must be a non-negative, finite number"
+      )
+    );
+
+    const nan = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: "/non/existent/a.png",
+          implementation_path: "/non/existent/b.png",
+          max_difference_percentage: NaN,
+        },
+      },
+    });
+    assert.strictEqual(nan.isError, true);
+    assert.ok(
+      nan.content[0].text.includes(
+        "max_difference_percentage must be a non-negative, finite number"
+      )
+    );
+  });
+
+  test("writes the diff file even when the gate trips (file mode)", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-file-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-file-impl.png");
+    const diff = path.join(__dirname, "../test-fixtures/gate-file-diff.png");
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: design,
+          implementation_path: impl,
+          output_diff_path: diff,
+          max_difference_percentage: 5,
+        },
+      },
+    });
+    assert.strictEqual(res.isError, true);
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(textItem.text.includes(`Diff image saved to: ${diff}`));
+    await fs.access(diff); // artifact written despite the trip
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+    await fs.unlink(diff);
+  });
+});
+
+describe("diff localization", () => {
+  test("counts only red-marker pixels (yellow AA and grayscale excluded)", async () => {
+    const { localizeDiff } = await import("./index.js");
+    const width = 6;
+    const height = 6;
+    const data = Buffer.alloc(width * height * 4, 255); // white, opaque
+    const paint = (x: number, y: number, rgba: number[]) => {
+      const idx = (y * width + x) << 2;
+      data[idx] = rgba[0]; data[idx + 1] = rgba[1]; data[idx + 2] = rgba[2]; data[idx + 3] = rgba[3];
+    };
+    paint(1, 1, [255, 0, 0, 255]); // red marker — counted
+    paint(2, 2, [255, 0, 0, 255]); // red marker — counted
+    paint(3, 3, [255, 255, 0, 255]); // AA yellow — must be excluded
+
+    const { diffBounds, heatGrid } = localizeDiff(
+      data, width, height, new Uint8Array(width * height)
+    );
+    assert.deepStrictEqual(diffBounds, { x: 1, y: 1, width: 2, height: 2 });
+    // 6x6 into 3x3 → 2x2 cells of 4 px. Red (1,1)→cell 0, (2,2)→cell 4.
+    // Yellow (3,3) also lands in cell 4 and would read 50 if counted.
+    assert.deepStrictEqual(heatGrid.cells, [25, 0, 0, 0, 25, 0, 0, 0, 0]);
+    assert.strictEqual(heatGrid.rows, 3);
+    assert.strictEqual(heatGrid.cols, 3);
+  });
+
+  test("floor partition covers every pixel exactly once (10x10 into 3x3)", async () => {
+    const { localizeDiff } = await import("./index.js");
+    const width = 10;
+    const height = 10;
+    const data = Buffer.alloc(width * height * 4);
+    for (let k = 0; k < width * height; k++) {
+      const idx = k << 2;
+      data[idx] = 255; data[idx + 1] = 0; data[idx + 2] = 0; data[idx + 3] = 255;
+    }
+    const { diffBounds, heatGrid } = localizeDiff(
+      data, width, height, new Uint8Array(width * height)
+    );
+    assert.deepStrictEqual(diffBounds, { x: 0, y: 0, width: 10, height: 10 });
+    // all-red: every cell must be exactly 100% — a skipped or double-counted
+    // pixel makes some cell diverge from 100.
+    assert.deepStrictEqual(heatGrid.cells, [100, 100, 100, 100, 100, 100, 100, 100, 100]);
+  });
+
+  test("last row/column absorbs the remainder", async () => {
+    const { localizeDiff } = await import("./index.js");
+    const width = 10;
+    const height = 10;
+    const data = Buffer.alloc(width * height * 4, 255); // white
+    const idx = (9 * width + 9) << 2;
+    data[idx] = 255; data[idx + 1] = 0; data[idx + 2] = 0; data[idx + 3] = 255; // red at (9,9)
+
+    const { diffBounds, heatGrid } = localizeDiff(
+      data, width, height, new Uint8Array(width * height)
+    );
+    assert.deepStrictEqual(diffBounds, { x: 9, y: 9, width: 1, height: 1 });
+    // cell boundaries at floor(10/3)=3 → last cell spans x,y ∈ [6,9]: 4x4 = 16 px
+    assert.strictEqual(heatGrid.cells[8], 6.25); // 1/16 * 100
+    assert.deepStrictEqual(heatGrid.cells.slice(0, 8), [0, 0, 0, 0, 0, 0, 0, 0]);
+  });
+
+  test("grids larger than the image stay in range (2x2 into 3x3)", async () => {
+    const { localizeDiff } = await import("./index.js");
+    const width = 2;
+    const height = 2;
+    const data = Buffer.alloc(width * height * 4, 255);
+    const idx = (1 * width + 1) << 2;
+    data[idx] = 255; data[idx + 1] = 0; data[idx + 2] = 0; data[idx + 3] = 255; // red at (1,1)
+
+    const { diffBounds, heatGrid } = localizeDiff(
+      data, width, height, new Uint8Array(width * height)
+    );
+    assert.deepStrictEqual(diffBounds, { x: 1, y: 1, width: 1, height: 1 });
+    // cellW/cellH clamp to 1: (1,1) → row 1, col 1 → cell 4; empty grid cells report 0
+    assert.deepStrictEqual(heatGrid.cells, [0, 0, 0, 0, 100, 0, 0, 0, 0]);
+  });
+
+  test("quadrant fixture: bbox, heat distribution, and area-weighted invariant", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-quad-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-quad-impl.png");
+    await createQuadrantPair(design, impl, 12, { x: 0, y: 0, width: 6, height: 6 });
+
+    const r = await expectOk(
+      compareScreenshots(design, impl, undefined, 0.1, true, "contain", [], true)
+    );
+    assert.strictEqual(r.differentPixels, 36);
+    assert.deepStrictEqual(r.diffBounds, { x: 0, y: 0, width: 6, height: 6 });
+    // 12x12 into 3x3 → 4x4 cells: blue block covers cell0 fully, cells 1 and 3
+    // half, cell 4 a quarter
+    assert.deepStrictEqual(r.heatGrid.cells, [100, 50, 0, 50, 25, 0, 0, 0, 0]);
+    // area-weighted invariant: all cells equal-sized (no mask) → plain mean of
+    // the cells equals differencePercentage
+    const mean = r.heatGrid.cells.reduce((a: number, b: number) => a + b, 0) / 9;
+    assert.ok(Math.abs(mean - r.differencePercentage) < 1e-9);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("red-marker pixels in the real diff equal differentPixels", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-inv-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-inv-impl.png");
+    await createQuadrantPair(design, impl, 12, { x: 3, y: 4, width: 5, height: 3 });
+
+    const r = await expectOk(compareScreenshots(design, impl));
+    const diffPng = PNG.sync.read(Buffer.from(r.diffImageBase64, "base64"));
+    let red = 0;
+    for (let k = 0; k < diffPng.width * diffPng.height; k++) {
+      const idx = k << 2;
+      if (
+        diffPng.data[idx] === 255 &&
+        diffPng.data[idx + 1] === 0 &&
+        diffPng.data[idx + 2] === 0 &&
+        diffPng.data[idx + 3] === 255
+      ) {
+        red++;
+      }
+    }
+    assert.strictEqual(red, r.differentPixels);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("masked region is excluded from bbox and heat", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-mask-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-mask-impl.png");
+    await createQuadrantPair(design, impl, 12, { x: 0, y: 0, width: 6, height: 6 });
+
+    // mask the top three rows of the blue block → remaining diff is y ∈ [3,5]
+    const r = await expectOk(
+      compareScreenshots(design, impl, undefined, 0.1, true, "contain", [
+        { x: 0, y: 0, width: 6, height: 3 },
+      ], true)
+    );
+    assert.strictEqual(r.maskedPixels, 18);
+    assert.strictEqual(r.differentPixels, 18);
+    assert.deepStrictEqual(r.diffBounds, { x: 0, y: 3, width: 6, height: 3 });
+    // cell0 (x0-3,y0-3): 12 of 16 px masked, remaining 4 all red → 100
+    assert.strictEqual(r.heatGrid.cells[0], 100);
+    // cell1 (x4-7,y0-3): 6 masked, 10 unmasked, 2 red → 20
+    assert.strictEqual(r.heatGrid.cells[1], 20);
+    // cell3 (x0-3,y4-7): unmasked, 8 of 16 red → 50
+    assert.strictEqual(r.heatGrid.cells[3], 50);
+    // cell4 (x4-7,y4-7): 4 of 16 red → 25
+    assert.strictEqual(r.heatGrid.cells[4], 25);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("fully-masked frame → diffBounds null, heatGrid all-zero", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-allmask-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-allmask-impl.png");
+    await createTestPNG(12, 12, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(12, 12, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const r = await expectOk(
+      compareScreenshots(design, impl, undefined, 0.1, true, "contain", [
+        { x: 0, y: 0, width: 12, height: 12 },
+      ], true)
+    );
+    assert.strictEqual(r.diffBounds, null);
+    assert.deepStrictEqual(r.heatGrid.cells, [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("zero-diff run → diffBounds null, heatGrid all-zero", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-zero-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-zero-impl.png");
+    await createTestPNG(9, 9, { r: 7, g: 8, b: 9, a: 255 }, design);
+    await createTestPNG(9, 9, { r: 7, g: 8, b: 9, a: 255 }, impl);
+
+    const r = await expectOk(compareScreenshots(design, impl));
+    assert.strictEqual(r.diffBounds, null);
+    assert.deepStrictEqual(r.heatGrid.cells, [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("localize=false omits both fields", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-off-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-off-impl.png");
+    await createQuadrantPair(design, impl, 12, { x: 0, y: 0, width: 6, height: 6 });
+
+    const r = await expectOk(
+      compareScreenshots(design, impl, undefined, 0.1, true, "contain", [], false)
+    );
+    assert.strictEqual(r.diffBounds, undefined);
+    assert.strictEqual(r.heatGrid, undefined);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+});
+
+describe("diff localization text output", () => {
+  test("appends Diff bounds and heat lines when diffs exist", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-text-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-text-impl.png");
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl },
+      },
+    });
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(textItem.text.includes("Diff bounds: x=0 y=0 w=10 h=10 (design space)"));
+    assert.ok(textItem.text.includes("Heat (3x3, % diff):"));
+    // full 100% diff → every heat row renders as "  100 100 100"
+    assert.ok(textItem.text.includes("  100 100 100"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("prints no bounds/heat lines on a zero-diff run", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-text0-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-text0-impl.png");
+    await createTestPNG(10, 10, { r: 5, g: 6, b: 7, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 5, g: 6, b: 7, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl },
+      },
+    });
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(!textItem.text.includes("Diff bounds:"));
+    assert.ok(!textItem.text.includes("Heat ("));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("prints no bounds/heat lines when localize is false", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/loc-textoff-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/loc-textoff-impl.png");
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, localize: false },
+      },
+    });
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(!textItem.text.includes("Diff bounds:"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("exposes localize in the tool schema", async () => {
+    const { handleListToolsRequest } = await import("./index.js");
+    const result = await handleListToolsRequest();
+    const schema = result.tools[0].inputSchema.properties as Record<string, unknown>;
+    assert.ok(schema.localize);
+  });
+});
+
+describe("normalizeDensity", () => {
+  test("defaults undefined to 288 and passes valid numbers through", async () => {
+    const { normalizeDensity } = await import("./index.js");
+    const def = normalizeDensity(undefined);
+    assert.strictEqual(def.success, true);
+    assert.strictEqual(def.value, 288);
+    const explicit = normalizeDensity(144);
+    assert.strictEqual(explicit.success, true);
+    assert.strictEqual(explicit.value, 144);
+  });
+
+  test("fails loud on non-number, NaN, zero, and negative", async () => {
+    const { normalizeDensity } = await import("./index.js");
+    for (const bad of ["288", 0, -1, NaN, null, {}]) {
+      const r = normalizeDensity(bad);
+      assert.strictEqual(r.success, false, `expected failure for ${String(bad)}`);
+      assert.match(r.error.message, /svg_density must be a positive, finite number/);
+    }
+  });
+});
+
+describe("SVG loading", () => {
+  test("renders an SVG at the given density (intrinsic x density/72)", async () => {
+    const { loadPNG } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/load-density.svg");
+    await createTestSVG(SVG_RED_36, svgPath);
+
+    const at288 = await expectOk(loadPNG(svgPath, undefined, 288));
+    assert.strictEqual(at288.width, 144); // 36 * 288/72
+    assert.strictEqual(at288.height, 144);
+    // solid full-bleed rect → first pixel is opaque red
+    assert.strictEqual(at288.data[0], 255);
+    assert.strictEqual(at288.data[3], 255);
+
+    const at72 = await expectOk(loadPNG(svgPath, undefined, 72));
+    assert.strictEqual(at72.width, 36);
+    assert.strictEqual(at72.height, 36);
+
+    await fs.unlink(svgPath);
+  });
+
+  test("resolves intrinsic size from viewBox when width/height are absent", async () => {
+    const { loadPNG } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/load-viewbox.svg");
+    await createTestSVG(SVG_VIEWBOX_ONLY, svgPath);
+
+    const png = await expectOk(loadPNG(svgPath, undefined, 288));
+    assert.strictEqual(png.width, 144);
+    assert.strictEqual(png.height, 144);
+
+    await fs.unlink(svgPath);
+  });
+
+  test("reports unsupported for .svg files with non-SVG bytes (cause preserved)", async () => {
+    const { loadPNG } = await import("./index.js");
+    const bogus = path.join(__dirname, "../test-fixtures/bogus.svg");
+    await fs.mkdir(path.dirname(bogus), { recursive: true });
+    await fs.writeFile(bogus, "this is not an svg");
+
+    const r = await loadPNG(bogus, undefined, 288);
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /Unsupported image format/);
+    // the underlying cause is preserved, not swallowed
+    assert.ok(r.error.message.length > "Unsupported image format: ".length + bogus.length);
+
+    await fs.unlink(bogus);
+  });
+});
+
+describe("SVG comparison", () => {
+  test("SVG design + PNG impl: reference dims are intrinsic x density/72", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-design.svg");
+    const impl = path.join(__dirname, "../test-fixtures/svg-design-impl.png");
+    await createTestSVG(SVG_RED_36, svgPath);
+    await createTestPNG(144, 144, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    const r = await expectOk(compareScreenshots(svgPath, impl)); // default density 288
+    assert.strictEqual(r.totalPixels, 144 * 144);
+    assert.strictEqual(r.differentPixels, 0);
+    assert.strictEqual(r.resized, undefined);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+
+  test("PNG design + SVG impl with matching intrinsic dims: no resized record, zero diff", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/svg-impl-design.png");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-impl.svg");
+    await createTestPNG(36, 36, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestSVG(SVG_RED_36, svgPath);
+
+    const r = await expectOk(compareScreenshots(design, svgPath));
+    assert.strictEqual(r.totalPixels, 36 * 36);
+    assert.strictEqual(r.differentPixels, 0);
+    // intrinsic dims match the design → not reported as a resize, even though
+    // the render happened at 288 dpi and was scaled down
+    assert.strictEqual(r.resized, undefined);
+
+    await fs.unlink(design);
+    await fs.unlink(svgPath);
+  });
+
+  test("SVG impl reports resized from its intrinsic (72 dpi) size", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/svg-resized-design.png");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-resized.svg");
+    await createTestPNG(72, 72, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestSVG(SVG_RED_36, svgPath);
+
+    const r = await expectOk(compareScreenshots(design, svgPath));
+    assert.deepStrictEqual(r.resized, {
+      fromWidth: 36,
+      fromHeight: 36,
+      toWidth: 72,
+      toHeight: 72,
+      fit: "contain",
+    });
+    assert.strictEqual(r.differentPixels, 0);
+
+    await fs.unlink(design);
+    await fs.unlink(svgPath);
+  });
+
+  test("auto_resize=false with an SVG impl errors on intrinsic-vs-design mismatch", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/svg-noresize-design.png");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-noresize.svg");
+    await createTestPNG(72, 72, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestSVG(SVG_RED_36, svgPath);
+
+    const r = await compareScreenshots(design, svgPath, undefined, 0.1, false);
+    assert.strictEqual(r.success, false);
+    assert.match(
+      r.error.message,
+      /Image dimensions don't match: design \(72x72\) vs implementation \(36x36\)/
+    );
+
+    await fs.unlink(design);
+    await fs.unlink(svgPath);
+  });
+
+  test("identical SVG on both sides → 0 diffs, diffBounds null, exact reference dims", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const a = path.join(__dirname, "../test-fixtures/svg-both-a.svg");
+    const b = path.join(__dirname, "../test-fixtures/svg-both-b.svg");
+    await createTestSVG(SVG_RED_36, a);
+    await createTestSVG(SVG_RED_36, b);
+
+    const r = await expectOk(compareScreenshots(a, b));
+    assert.strictEqual(r.totalPixels, 144 * 144); // 36x36 @ 288 → 144x144
+    assert.strictEqual(r.differentPixels, 0);
+    assert.strictEqual(r.diffBounds, null);
+
+    await fs.unlink(a);
+    await fs.unlink(b);
+  });
+
+  test("viewBox-only SVG resolves dims from viewBox", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-viewbox.svg");
+    const impl = path.join(__dirname, "../test-fixtures/svg-viewbox-impl.png");
+    await createTestSVG(SVG_VIEWBOX_ONLY, svgPath);
+    await createTestPNG(144, 144, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    const r = await expectOk(compareScreenshots(svgPath, impl));
+    assert.strictEqual(r.totalPixels, 144 * 144);
+    assert.strictEqual(r.differentPixels, 0);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+
+  test("SVG with no derivable intrinsic size fails loud as design and as impl", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const noSize = path.join(__dirname, "../test-fixtures/svg-nosize.svg");
+    const png = path.join(__dirname, "../test-fixtures/svg-nosize-peer.png");
+    await createTestSVG(SVG_NO_SIZE, noSize);
+    await createTestPNG(36, 36, { r: 1, g: 2, b: 3, a: 255 }, png);
+
+    const asDesign = await compareScreenshots(noSize, png);
+    assert.strictEqual(asDesign.success, false);
+    assert.match(asDesign.error.message, /no derivable intrinsic size/);
+
+    const asImpl = await compareScreenshots(png, noSize);
+    assert.strictEqual(asImpl.success, false);
+    assert.match(asImpl.error.message, /no derivable intrinsic size/);
+
+    await fs.unlink(noSize);
+    await fs.unlink(png);
+  });
+
+  test(".svg extension with non-SVG bytes fails through the format-error path", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/svg-bogus-design.png");
+    const bogus = path.join(__dirname, "../test-fixtures/svg-bogus.svg");
+    await createTestPNG(36, 36, { r: 1, g: 2, b: 3, a: 255 }, design);
+    await fs.writeFile(bogus, "this is not an svg");
+
+    const r = await compareScreenshots(design, bogus);
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /Unsupported image format/);
+
+    await fs.unlink(design);
+    await fs.unlink(bogus);
+  });
+
+  test("higher svg_density does not increase diff % on an AA-heavy shape", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/density-circle.svg");
+    const design = path.join(__dirname, "../test-fixtures/density-design.png");
+    await createTestSVG(SVG_CIRCLE_36, svgPath);
+    // Clean 72x72 reference: render the same circle at very high density and
+    // downscale — generated in-test on this platform, so no cross-platform
+    // golden flakiness; the assertion below is relational.
+    const ref = await sharp(Buffer.from(SVG_CIRCLE_36), { density: 1152 })
+      .resize(72, 72)
+      .png()
+      .toBuffer();
+    await fs.mkdir(path.dirname(design), { recursive: true });
+    await fs.writeFile(design, ref);
+
+    // svg_density 72 floors up to the effective ceil(72 * 72/36) = 144
+    const low = await expectOk(
+      compareScreenshots(design, svgPath, undefined, 0.1, true, "contain", [], true, 72)
+    );
+    const high = await expectOk(
+      compareScreenshots(design, svgPath, undefined, 0.1, true, "contain", [], true, 576)
+    );
+    assert.ok(high.differencePercentage <= low.differencePercentage + 0.5);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(design);
+  });
+
+  test("invalid svg_density fails loud even for raster-only inputs", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/svg-badden-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/svg-badden-impl.png");
+    await createTestPNG(8, 8, { r: 1, g: 1, b: 1, a: 255 }, design);
+    await createTestPNG(8, 8, { r: 1, g: 1, b: 1, a: 255 }, impl);
+
+    const r = await compareScreenshots(
+      design, impl, undefined, 0.1, true, "contain", [], true, -5
+    );
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /svg_density must be a positive, finite number/);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("bounds-checks unbounded render cost (huge density fails loud)", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-huge.svg");
+    const impl = path.join(__dirname, "../test-fixtures/svg-huge-impl.png");
+    await createTestSVG(SVG_RED_36, svgPath);
+    await createTestPNG(36, 36, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    // 36 * 1e7/72 = 5,000,000 px per side — far past the 8192x8192 cap
+    const r = await compareScreenshots(
+      svgPath, impl, undefined, 0.1, true, "contain", [], true, 1e7
+    );
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /svg_density too high/);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+});
+
+describe("svg_density in the handler", () => {
+  test("exposes svg_density in the tool schema", async () => {
+    const { handleListToolsRequest } = await import("./index.js");
+    const result = await handleListToolsRequest();
+    const schema = result.tools[0].inputSchema.properties as Record<string, unknown>;
+    assert.ok(schema.svg_density);
+  });
+
+  test("passes svg_density through and compares an SVG at the requested density", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/h-svg.svg");
+    const impl = path.join(__dirname, "../test-fixtures/h-svg-impl.png");
+    await createTestSVG(SVG_RED_36, svgPath);
+    await createTestPNG(72, 72, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: svgPath, implementation_path: impl, svg_density: 144 },
+      },
+    });
+    assert.strictEqual(res.isError, undefined);
+    const textItem = res.content.find((c: any) => c.type === "text");
+    // 36x36 @ 144 dpi → 72x72 reference = 5,184 pixels
+    assert.ok(textItem.text.includes("Total Pixels: 5,184"));
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+
+  test("returns isError on invalid svg_density", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/h-svg-bad-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/h-svg-bad-impl.png");
+    await createTestPNG(8, 8, { r: 1, g: 1, b: 1, a: 255 }, design);
+    await createTestPNG(8, 8, { r: 1, g: 1, b: 1, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl, svg_density: 0 },
+      },
+    });
+    assert.strictEqual(res.isError, true);
+    assert.ok(
+      res.content[0].text.includes("svg_density must be a positive, finite number")
+    );
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
   });
 });
