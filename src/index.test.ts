@@ -1615,6 +1615,34 @@ describe("SVG comparison", () => {
     await fs.unlink(svgPath);
     await fs.unlink(impl);
   });
+
+  test("wide design + square SVG impl under 'contain' is letterboxed, not rejected as too-dense", async () => {
+    // An SVG implementation compared against a design with an extreme aspect
+    // ratio succeeds under the default 'contain' fit. 'contain' letterboxes
+    // the SVG so it fills only the constraining (smaller-scale) axis; the
+    // render density is therefore sized from min(scaleW, scaleH). A 36x36 SVG
+    // into a 9000x100 design renders a 144x144 intermediate at density 288 and
+    // compares cleanly.
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/svg-wide-design.png");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-wide-impl.svg");
+    await createTestPNG(9000, 100, { r: 0, g: 0, b: 255, a: 255 }, design);
+    await createTestSVG(SVG_RED_36, svgPath); // 36x36 intrinsic
+
+    // Default density 288, contain: the min-axis scale keeps the 36x36
+    // intermediate at 144x144, well under the 8192x8192 render cap.
+    const r = await expectOk(compareScreenshots(design, svgPath));
+    assert.deepStrictEqual(r.resized, {
+      fromWidth: 36,
+      fromHeight: 36,
+      toWidth: 9000,
+      toHeight: 100,
+      fit: "contain",
+    });
+
+    await fs.unlink(design);
+    await fs.unlink(svgPath);
+  });
 });
 
 describe("svg_density in the handler", () => {
