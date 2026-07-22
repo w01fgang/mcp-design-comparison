@@ -1781,6 +1781,296 @@ describe("SVG comparison", () => {
     await fs.unlink(design);
     await fs.unlink(svgPath);
   });
+
+  // The intrinsic-size pre-check must not reject VALID, sharp-renderable SVGs.
+  // A '>' inside a quoted attribute value and a '<svg' inside a pre-root comment
+  // are both legal and renderable; the root-tag scan must not truncate on the
+  // quoted '>' nor latch onto the commented tag.
+  test("SVG with '>' inside a quoted attribute value is not rejected as sizeless", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-gt-attr.svg");
+    const impl = path.join(__dirname, "../test-fixtures/svg-gt-attr-impl.png");
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" aria-label="if x > 0" width="36" height="36"><rect width="36" height="36" fill="#ff0000"/></svg>';
+    await createTestSVG(svg, svgPath);
+    await createTestPNG(144, 144, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    const r = await expectOk(compareScreenshots(svgPath, impl)); // default density 288
+    assert.ok(r.differencePercentage !== undefined);
+    assert.strictEqual(r.totalPixels, 144 * 144);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+
+  test("SVG with a '<svg>' comment before the real root is not rejected as sizeless", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-comment-root.svg");
+    const impl = path.join(__dirname, "../test-fixtures/svg-comment-root-impl.png");
+    const svg =
+      '<!-- <svg> --><svg xmlns="http://www.w3.org/2000/svg" width="36" height="36"><rect width="36" height="36" fill="#ff0000"/></svg>';
+    await createTestSVG(svg, svgPath);
+    await createTestPNG(144, 144, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    const r = await expectOk(compareScreenshots(svgPath, impl));
+    assert.ok(r.differencePercentage !== undefined);
+    assert.strictEqual(r.totalPixels, 144 * 144);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+
+  // The SVG <length> grammar permits an optional leading '+'; sharp/librsvg
+  // render width="+36" height="+36" as 36x36. The pre-check must not treat a
+  // legal signed length as sizeless.
+  test("SVG with leading '+' in width/height is not rejected as sizeless", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-plus-size.svg");
+    const impl = path.join(__dirname, "../test-fixtures/svg-plus-size-impl.png");
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="+36" height="+36"><rect width="36" height="36" fill="#ff0000"/></svg>';
+    await createTestSVG(svg, svgPath);
+    await createTestPNG(144, 144, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    const r = await expectOk(compareScreenshots(svgPath, impl)); // default density 288
+    assert.ok(r.differencePercentage !== undefined);
+    assert.strictEqual(r.totalPixels, 144 * 144);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+
+  // A leading '-' is a negative length: no positive viewport, and with no
+  // viewBox the SVG derives no intrinsic size.
+  test("SVG with negative width/height and no viewBox is rejected", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-neg-size.svg");
+    const png = path.join(__dirname, "../test-fixtures/svg-neg-size-peer.png");
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="-36" height="-36"><rect width="36" height="36" fill="#ff0000"/></svg>';
+    await createTestSVG(svg, svgPath);
+    await createTestPNG(36, 36, { r: 255, g: 0, b: 0, a: 255 }, png);
+
+    const r = await compareScreenshots(svgPath, png);
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /no derivable intrinsic size/);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(png);
+  });
+
+  test("genuinely sizeless SVG (no width/height, no viewBox) is still rejected", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-still-nosize.svg");
+    const png = path.join(__dirname, "../test-fixtures/svg-still-nosize-peer.png");
+    await createTestSVG(SVG_NO_SIZE, svgPath);
+    await createTestPNG(36, 36, { r: 255, g: 0, b: 0, a: 255 }, png);
+
+    const r = await compareScreenshots(svgPath, png);
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /no derivable intrinsic size/);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(png);
+  });
+
+  // The size check keys on attribute NAMES: 'width=' / 'height=' text inside an
+  // attribute VALUE is not a size attribute, so this SVG stays sizeless.
+  test("sizeless SVG with width=/height= only inside an attribute value is rejected", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-valuetext-nosize.svg");
+    const png = path.join(__dirname, "../test-fixtures/svg-valuetext-nosize-peer.png");
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" aria-label="x > width= height="><rect width="36" height="36" fill="#ff0000"/></svg>';
+    await createTestSVG(svg, svgPath);
+    await createTestPNG(36, 36, { r: 255, g: 0, b: 0, a: 255 }, png);
+
+    const r = await compareScreenshots(svgPath, png);
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /no derivable intrinsic size/);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(png);
+  });
+
+  // stroke-width is a distinct attribute name from width; a hyphen-prefixed name
+  // does not satisfy the width requirement. A real height is present so the only
+  // thing standing between this SVG and a false pass is the hyphen distinction.
+  test("sizeless SVG whose only width-like attr is stroke-width is rejected", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-strokewidth-nosize.svg");
+    const png = path.join(__dirname, "../test-fixtures/svg-strokewidth-nosize-peer.png");
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" stroke-width="2" height="36"><rect width="36" height="36" fill="#ff0000"/></svg>';
+    await createTestSVG(svg, svgPath);
+    await createTestPNG(36, 36, { r: 255, g: 0, b: 0, a: 255 }, png);
+
+    const r = await compareScreenshots(svgPath, png);
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /no derivable intrinsic size/);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(png);
+  });
+
+  // Real width/height attributes win even when an attribute value also contains
+  // size-looking text — the value text is ignored, the real names are matched.
+  test("valid SVG with size-looking value text plus real width/height succeeds", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-valuetext-realsize.svg");
+    const impl = path.join(__dirname, "../test-fixtures/svg-valuetext-realsize-impl.png");
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" aria-label="width=99" width="36" height="36"><rect width="36" height="36" fill="#ff0000"/></svg>';
+    await createTestSVG(svg, svgPath);
+    await createTestPNG(144, 144, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    const r = await expectOk(compareScreenshots(svgPath, impl)); // default density 288
+    assert.ok(r.differencePercentage !== undefined);
+    assert.strictEqual(r.totalPixels, 144 * 144);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+
+  test("viewBox-only SVG (no width/height) is not rejected as sizeless", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-viewbox-only.svg");
+    const impl = path.join(__dirname, "../test-fixtures/svg-viewbox-only-impl.png");
+    await createTestSVG(SVG_VIEWBOX_ONLY, svgPath);
+    await createTestPNG(144, 144, { r: 255, g: 0, b: 0, a: 255 }, impl);
+
+    const r = await expectOk(compareScreenshots(svgPath, impl));
+    assert.ok(r.differencePercentage !== undefined);
+    assert.strictEqual(r.totalPixels, 144 * 144);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(impl);
+  });
+
+  // Derivability keys on the size VALUE, not name presence. An empty viewBox=""
+  // registers the name 'viewbox' but derives no viewport; librsvg would
+  // otherwise fabricate one from <rect> content (a 4x4 here), so comparison
+  // must be rejected deterministically before that fallback runs.
+  test("sizeless SVG with empty viewBox and only rect content is rejected", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-emptyvb-nosize.svg");
+    const png = path.join(__dirname, "../test-fixtures/svg-emptyvb-nosize-peer.png");
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox=""><rect x="0" y="0" width="4" height="4" fill="red"/></svg>';
+    await createTestSVG(svg, svgPath);
+    await createTestPNG(4, 4, { r: 255, g: 0, b: 0, a: 255 }, png);
+
+    const asDesign = await compareScreenshots(svgPath, png);
+    assert.strictEqual(asDesign.success, false);
+    assert.match(asDesign.error.message, /no derivable intrinsic size/);
+
+    const asImpl = await compareScreenshots(png, svgPath);
+    assert.strictEqual(asImpl.success, false);
+    assert.match(asImpl.error.message, /no derivable intrinsic size/);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(png);
+  });
+
+  // Empty width=""/height="" register the names but derive no size; a nonzero
+  // <rect> would otherwise seed a librsvg-invented viewport, so this is
+  // rejected before that fallback runs.
+  test("sizeless SVG with empty width/height values is rejected", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-emptywh-nosize.svg");
+    const png = path.join(__dirname, "../test-fixtures/svg-emptywh-nosize-peer.png");
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="" height=""><rect x="0" y="0" width="4" height="4" fill="red"/></svg>';
+    await createTestSVG(svg, svgPath);
+    await createTestPNG(4, 4, { r: 255, g: 0, b: 0, a: 255 }, png);
+
+    const r = await compareScreenshots(svgPath, png);
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /no derivable intrinsic size/);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(png);
+  });
+
+  // A zero-extent viewBox="0 0 0 0" parses to four numbers but its width and
+  // height are zero, so no positive viewport derives and it is rejected.
+  test("sizeless SVG with zero-extent viewBox is rejected", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-zerovb-nosize.svg");
+    const png = path.join(__dirname, "../test-fixtures/svg-zerovb-nosize-peer.png");
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 0 0"><rect x="0" y="0" width="4" height="4" fill="red"/></svg>';
+    await createTestSVG(svg, svgPath);
+    await createTestPNG(4, 4, { r: 255, g: 0, b: 0, a: 255 }, png);
+
+    const r = await compareScreenshots(svgPath, png);
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /no derivable intrinsic size/);
+
+    await fs.unlink(svgPath);
+    await fs.unlink(png);
+  });
+
+  // Regression: a huge attribute-less root tag (<svg aaaa…a>) is syntactically
+  // valid but sizeless. Attribute-name extraction must be linear — a global
+  // name=value regex backtracks O(n^2) here (~4.7s at 100k chars), hanging the
+  // process. The single-pass scan rejects in a few ms; the bound separates them.
+  test("huge attribute-less SVG root tag rejects fast (no quadratic hang)", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const svgPath = path.join(__dirname, "../test-fixtures/svg-redos-nosize.svg");
+    const png = path.join(__dirname, "../test-fixtures/svg-redos-nosize-peer.png");
+    const svg = "<svg " + "a".repeat(100000) + "></svg>";
+    await createTestSVG(svg, svgPath);
+    await createTestPNG(36, 36, { r: 255, g: 0, b: 0, a: 255 }, png);
+
+    const start = Date.now();
+    const r = await compareScreenshots(svgPath, png);
+    const elapsedMs = Date.now() - start;
+    assert.strictEqual(r.success, false);
+    assert.match(r.error.message, /no derivable intrinsic size/);
+    assert.ok(
+      elapsedMs < 2000,
+      `attribute-name extraction took ${elapsedMs}ms; expected linear (< 2000ms)`
+    );
+
+    await fs.unlink(svgPath);
+    await fs.unlink(png);
+  });
+
+  // Regression: a truncated or snippet-laden file where '<svg' recurs but no
+  // closing '>' ever appears. The root-tag detector must scan to '>' once from
+  // the first '<svg', not restart the scan at every '<svg' anchor — a
+  // backtracking regex (/<svg\b(?:[^>"']|…)*>/) does the latter, O(n^2)
+  // (~1.4s at 200KB, ~5.6s at 375KB). The linear finder walks the input once
+  // and rejects/returns in a few ms; the time bound separates them.
+  test("recurring <svg with no closing > is size-checked linearly (no ReDoS)", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const peer = path.join(__dirname, "../test-fixtures/svg-redos-noclose-peer.png");
+    await createTestPNG(36, 36, { r: 255, g: 0, b: 0, a: 255 }, peer);
+
+    const shapes = [
+      "<svg viewBox=\"0 0 10 10\" ".repeat(16000), // embedded-snippet shape
+      "<svg\t".repeat(16000) + "a".repeat(500), // whitespace-anchor scaling shape
+    ];
+    for (let k = 0; k < shapes.length; k++) {
+      const svgPath = path.join(
+        __dirname,
+        `../test-fixtures/svg-redos-noclose-${k}.svg`
+      );
+      await createTestSVG(shapes[k], svgPath);
+      const start = Date.now();
+      const r = await compareScreenshots(svgPath, peer);
+      const elapsedMs = Date.now() - start;
+      assert.strictEqual(r.success, false);
+      assert.ok(
+        elapsedMs < 2000,
+        `root-tag size pre-check took ${elapsedMs}ms on shape ${k}; expected linear (< 2000ms)`
+      );
+      await fs.unlink(svgPath);
+    }
+
+    await fs.unlink(peer);
+  });
 });
 
 describe("svg_density in the handler", () => {

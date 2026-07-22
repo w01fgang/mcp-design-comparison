@@ -105,13 +105,130 @@ function checkSvgRenderCost(
   return { success: true, value: undefined };
 }
 
+// Collect attribute name→value pairs from a start tag in one linear
+// left-to-right pass. Each attribute is read name-then-optional-value with
+// quoted ("…"/'…') and unquoted values consumed whole, so value text is never
+// read as a name. Names are lowercased; each value is the inner text of a
+// quoted value or the unquoted token, kept verbatim. A name with no '=' maps
+// to "". The single pass is O(tag length): an attribute-less blob (e.g.
+// <svg aaaa…a>) is walked once, avoiding the quadratic backtracking a global
+// name=value regex suffers when a long name token has no following '='.
+function collectStartTagAttributes(tag: string): Map<string, string> {
+  const attrs = new Map<string, string>();
+  const n = tag.length;
+  const isSpace = (c: string): boolean =>
+    c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
+  let i = 0;
+  // Skip the tag opener up to the first whitespace (e.g. '<svg').
+  while (i < n && !isSpace(tag[i])) i++;
+  while (i < n) {
+    while (i < n && (isSpace(tag[i]) || tag[i] === "/" || tag[i] === ">")) i++;
+    if (i >= n) break;
+    const nameStart = i;
+    while (
+      i < n &&
+      !isSpace(tag[i]) &&
+      tag[i] !== "=" &&
+      tag[i] !== "/" &&
+      tag[i] !== ">"
+    )
+      i++;
+    const name = i > nameStart ? tag.slice(nameStart, i).toLowerCase() : "";
+    while (i < n && isSpace(tag[i])) i++;
+    let value = "";
+    if (i < n && tag[i] === "=") {
+      i++;
+      while (i < n && isSpace(tag[i])) i++;
+      const quote = tag[i];
+      if (quote === '"' || quote === "'") {
+        i++;
+        const valStart = i;
+        while (i < n && tag[i] !== quote) i++;
+        value = tag.slice(valStart, i);
+        if (i < n) i++; // consume closing quote
+      } else {
+        const valStart = i;
+        while (i < n && !isSpace(tag[i]) && tag[i] !== ">") i++;
+        value = tag.slice(valStart, i);
+      }
+    }
+    if (name) attrs.set(name, value);
+  }
+  return attrs;
+}
+
+// A width/height value yields a positive viewport only when it begins with a
+// number greater than zero. The SVG <length> grammar permits an optional
+// leading '+' sign, so "+36" derives a positive size. Empty (width=""), zero,
+// negative (leading '-'), and non-numeric values derive no positive size —
+// unit interpretation (px/pt/mm/%) defers to librsvg beyond the sign.
+function isPositiveLength(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const m = /^\s*\+?(\d*\.?\d+)/.exec(value);
+  return m !== null && parseFloat(m[1]) > 0;
+}
+
+// A viewBox yields a positive viewport only when it parses to four numbers
+// whose width and height (the 3rd and 4th) are both greater than zero. An
+// empty viewBox="" and a zero-extent "0 0 0 0" derive no size.
+function viewBoxHasPositiveExtent(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const nums = value.trim().split(/[\s,]+/).filter(Boolean).map(Number);
+  return (
+    nums.length >= 4 &&
+    nums.every((x) => Number.isFinite(x)) &&
+    nums[2] > 0 &&
+    nums[3] > 0
+  );
+}
+
+// Locate the root <svg> element's start tag in a single linear pass. The
+// first '<svg' followed by a name boundary (end of input or a non-word char,
+// mirroring \b) is the root; from there the tag runs to its closing '>', with
+// quoted ("…"/'…') spans skipped so a '>' inside an attribute value never ends
+// the tag early. A truncated or malformed root whose start tag has no closing
+// '>' yields null, and sharp then reports the real decode error. Cost is
+// O(source length): the forward scan to '>' runs once from the first '<svg'
+// root candidate, so an input carrying many '<svg' starts with no '>' (a
+// truncated or snippet-laden file) is walked once, never once per '<svg'.
+function findSvgRootStartTag(source: string): string | null {
+  const lower = source.toLowerCase();
+  const n = source.length;
+  const isWordChar = (c: string): boolean =>
+    (c >= "a" && c <= "z") || (c >= "0" && c <= "9") || c === "_";
+  let from = 0;
+  for (;;) {
+    const start = lower.indexOf("<svg", from);
+    if (start === -1) return null;
+    const after = start + 4;
+    if (after >= n || !isWordChar(lower[after])) {
+      let i = after;
+      while (i < n) {
+        const c = source[i];
+        if (c === '"' || c === "'") {
+          i++;
+          while (i < n && source[i] !== c) i++;
+          if (i < n) i++; // consume closing quote
+          continue;
+        }
+        if (c === ">") return source.slice(start, i + 1);
+        i++;
+      }
+      return null; // start tag has no closing '>' — no derivable root here
+    }
+    from = after;
+  }
+}
+
 // Intrinsic-size pre-check for SVG inputs. librsvg's behaviour for a root
 // <svg> with neither width/height nor viewBox varies across versions (some
 // throw in metadata(), some invent a default viewport), so the
 // no-derivable-size case is detected deterministically here — and this check
 // must run BEFORE probeDimensions on every SVG path, so the clear
 // "no derivable intrinsic size" cause wins regardless of librsvg behaviour.
-// Presence-only check: value interpretation (px/pt/mm/%) defers to librsvg.
+// Derivability keys on size attributes resolving to a positive viewport, not
+// mere name presence: an empty viewBox="" or width=""/height="" derives no
+// size and is rejected here rather than handed to a librsvg-invented viewport.
 // Non-SVG bytes pass through so sharp reports the real decode error with its
 // cause; a missing file keeps the "File not found" convention via checkExists.
 async function checkSvgIntrinsicSize(filePath: string): Promise<TryResult<void>> {
@@ -123,13 +240,23 @@ async function checkSvgIntrinsicSize(filePath: string): Promise<TryResult<void>>
   if (!read.success) {
     return fail(`Unsupported image format: ${filePath} (${read.error.message})`);
   }
-  const rootTag = /<svg\b[^>]*>/i.exec(read.value);
-  if (!rootTag) {
+  // Strip XML comments first so a commented-out <svg> before the real root is
+  // not taken for it; findSvgRootStartTag then locates the true root start tag.
+  const source = read.value.replace(/<!--[\s\S]*?-->/g, "");
+  const rootTag = findSvgRootStartTag(source);
+  if (rootTag === null) {
     return { success: true, value: undefined }; // not an SVG root — let sharp report it
   }
+  // Size derives from attribute NAME and VALUE: width/height count only when
+  // both begin with a positive number, and viewBox only when it parses to four
+  // numbers with positive width/height. Text inside an attribute value
+  // (e.g. aria-label="width= height=") is never read as a name, a
+  // hyphen-prefixed name (stroke-width, data-width) stays distinct from width,
+  // and an empty value (viewBox="", width="") derives no size.
+  const attrs = collectStartTagAttributes(rootTag);
   const hasWidthHeight =
-    /\bwidth\s*=/i.test(rootTag[0]) && /\bheight\s*=/i.test(rootTag[0]);
-  const hasViewBox = /\bviewBox\s*=/i.test(rootTag[0]);
+    isPositiveLength(attrs.get("width")) && isPositiveLength(attrs.get("height"));
+  const hasViewBox = viewBoxHasPositiveExtent(attrs.get("viewbox"));
   if (!hasWidthHeight && !hasViewBox) {
     return fail(
       `Unsupported image format: ${filePath} (SVG has no derivable intrinsic size: no width/height attributes and no viewBox)`
