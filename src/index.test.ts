@@ -1066,6 +1066,85 @@ describe("max_difference_percentage gate", () => {
     await fs.unlink(impl);
     await fs.unlink(diff);
   });
+
+  // A fully-masked comparison compares nothing, so the gate cannot be satisfied.
+  // Passing it green would hide a masking/region bug that covers the whole frame.
+  test("fails loud when the entire image is masked (nothing compared)", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-allmask-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-allmask-impl.png");
+    // clearly different images: full red vs full blue
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: design,
+          implementation_path: impl,
+          ignore_regions: [{ x: 0, y: 0, width: 10, height: 10 }],
+          max_difference_percentage: 0,
+        },
+      },
+    });
+    assert.strictEqual(res.isError, true);
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(textItem.text.startsWith("Gate failed: no pixels compared"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("full mask without a gate still passes (gate fails only when requested)", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-allmask-nogate-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-allmask-nogate-impl.png");
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: design,
+          implementation_path: impl,
+          ignore_regions: [{ x: 0, y: 0, width: 10, height: 10 }],
+        },
+      },
+    });
+    assert.strictEqual(res.isError, undefined);
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(textItem.text.includes("no pixels compared"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  test("partially-masked comparison under the gate still passes (real pixels compared)", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/gate-partmask-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/gate-partmask-impl.png");
+    // identical images; masking half leaves real pixels that are 0% different
+    await createTestPNG(10, 10, { r: 100, g: 150, b: 200, a: 255 }, design);
+    await createTestPNG(10, 10, { r: 100, g: 150, b: 200, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: design,
+          implementation_path: impl,
+          ignore_regions: [{ x: 0, y: 0, width: 5, height: 10 }],
+          max_difference_percentage: 0,
+        },
+      },
+    });
+    assert.strictEqual(res.isError, undefined);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
 });
 
 describe("diff localization", () => {
