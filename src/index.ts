@@ -166,11 +166,11 @@ export async function handleCallToolRequest(
       implementation_path?: string;
       output_diff_path?: string;
       threshold?: unknown;
-      auto_resize?: boolean;
+      auto_resize?: unknown;
       resize_fit?: string;
       ignore_regions?: unknown;
       max_difference_percentage?: unknown;
-      localize?: boolean;
+      localize?: unknown;
       svg_density?: unknown;
     };
     const {
@@ -200,6 +200,15 @@ export async function handleCallToolRequest(
       return errorResponse(
         "max_difference_percentage must be a non-negative, finite number"
       );
+    }
+
+    // A non-boolean auto_resize/localize must fail loud, not silently flip
+    // behavior: a truthy string like "false" would otherwise invert the mode.
+    if (typeof auto_resize !== "boolean") {
+      return errorResponse("auto_resize must be a boolean");
+    }
+    if (typeof localize !== "boolean") {
+      return errorResponse("localize must be a boolean");
     }
 
     const resizeFit = normalizeResizeFit(resize_fit);
