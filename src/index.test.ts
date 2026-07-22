@@ -1697,3 +1697,102 @@ describe("svg_density in the handler", () => {
     await fs.unlink(impl);
   });
 });
+
+describe("EXIF orientation auto-rotate", () => {
+  // display space: 200 wide x 100 tall, left half red / right half blue.
+  // Asymmetric on both axes, so an un-rotated axis-swap reads as a gross diff.
+  function buildDisplayPNG(): PNG {
+    const W = 200;
+    const H = 100;
+    const png = new PNG({ width: W, height: H });
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const idx = (W * y + x) << 2;
+        const red = x < W / 2;
+        png.data[idx] = red ? 255 : 0;
+        png.data[idx + 1] = 0;
+        png.data[idx + 2] = red ? 0 : 255;
+        png.data[idx + 3] = 255;
+      }
+    }
+    return png;
+  }
+
+  // orientation 6 = viewer rotates the stored image 90° clockwise to display it,
+  // so the stored pixels are the display rotated 90° counter-clockwise
+  // (sharp rotate 270). TIFF + 90° rotation is lossless, so the twin survives.
+  async function writeOrientedTIFF(dispBuf: Buffer, filePath: string): Promise<void> {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const stored = await sharp(dispBuf)
+      .rotate(270)
+      .tiff()
+      .withMetadata({ orientation: 6 })
+      .toBuffer();
+    await fs.writeFile(filePath, stored);
+  }
+
+  // WHY: an EXIF-oriented screenshot that is the visual twin of the design must
+  // compare as near-zero. Measuring it in stored (un-oriented) pixel space swaps
+  // the axes and reports a ~88% false regression.
+  test("oriented impl that is the design's visual twin compares as near-zero", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/exif-twin-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/exif-twin-impl.tiff");
+    const dispBuf = PNG.sync.write(buildDisplayPNG());
+    await fs.mkdir(path.dirname(design), { recursive: true });
+    await fs.writeFile(design, dispBuf);
+    await writeOrientedTIFF(dispBuf, impl);
+
+    const r = await expectOk(compareScreenshots(design, impl));
+    // probe reported DISPLAY dims (200x100 == design) → no resize path taken
+    assert.strictEqual(r.resized, undefined);
+    assert.ok(
+      r.differencePercentage < 2,
+      `expected near-zero for the visual twin, got ${r.differencePercentage}%`
+    );
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  // Direct probe assertion: a different design size forces a resize, exposing the
+  // impl's probed dimensions via resized.from{Width,Height} — which must be the
+  // display dims (200x100), not the stored dims (100x200).
+  test("dimension probe of the oriented file yields display dims (200x100)", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/exif-probe-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/exif-probe-impl.tiff");
+    await createTestPNG(100, 50, { r: 0, g: 0, b: 0, a: 255 }, design);
+    await writeOrientedTIFF(PNG.sync.write(buildDisplayPNG()), impl);
+
+    const r = await expectOk(compareScreenshots(design, impl));
+    assert.strictEqual(r.resized.fromWidth, 200);
+    assert.strictEqual(r.resized.fromHeight, 100);
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
+  // Regression guard: the added .rotate() must be a no-op for a file with no
+  // orientation tag — a plain TIFF twin still compares as near-zero, no resize.
+  test("non-oriented control (plain TIFF twin) still compares as near-zero", async () => {
+    const { compareScreenshots } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/exif-ctrl-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/exif-ctrl-impl.tiff");
+    const dispBuf = PNG.sync.write(buildDisplayPNG());
+    await fs.mkdir(path.dirname(design), { recursive: true });
+    await fs.writeFile(design, dispBuf);
+    await fs.mkdir(path.dirname(impl), { recursive: true });
+    await fs.writeFile(impl, await sharp(dispBuf).tiff().toBuffer());
+
+    const r = await expectOk(compareScreenshots(design, impl));
+    assert.strictEqual(r.resized, undefined);
+    assert.ok(
+      r.differencePercentage < 2,
+      `expected near-zero for the plain twin, got ${r.differencePercentage}%`
+    );
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+});

@@ -171,9 +171,9 @@ export async function loadPNG(
     // sets the librsvg rasterization DPI — output pixels = intrinsic size x
     // (density / 72). The rest of the pipeline is shared with rasters.
     const density = isSvgPath(filePath) ? svgDensity : undefined;
-    let pipeline = (
-      density !== undefined ? sharp(filePath, { density }) : sharp(filePath)
-    ).ensureAlpha(); // RGBA
+    let pipeline = (density !== undefined ? sharp(filePath, { density }) : sharp(filePath))
+      .rotate() // EXIF auto-orient; must run before resize below
+      .ensureAlpha(); // RGBA
     if (resizeTo) {
       // `fit` controls scaling when reconciling dimensions:
       //   contain — preserve aspect, letterbox the remainder (transparent pad)
@@ -211,11 +211,16 @@ async function probeDimensions(
   if (!meta.success) {
     return fail(`Unsupported image format: ${filePath} (${meta.error.message})`);
   }
-  const { width, height } = meta.value;
+  const { width, height, orientation } = meta.value;
   if (!width || !height) {
     return fail(`Unsupported image format: ${filePath} (no derivable intrinsic size)`);
   }
-  return { success: true, value: { width, height } };
+  // EXIF orientation 5–8 swap the axes: report display (not stored) dimensions.
+  const swap = orientation !== undefined && orientation >= 5;
+  return {
+    success: true,
+    value: { width: swap ? height : width, height: swap ? width : height },
+  };
 }
 
 /**
