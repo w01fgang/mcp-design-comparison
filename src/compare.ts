@@ -123,7 +123,11 @@ async function checkSvgIntrinsicSize(filePath: string): Promise<TryResult<void>>
   if (!read.success) {
     return fail(`Unsupported image format: ${filePath} (${read.error.message})`);
   }
-  const rootTag = /<svg\b[^>]*>/i.exec(read.value);
+  // Strip comments so a commented-out <svg> before the real root can't match.
+  // The root-tag pattern treats quoted attribute values as opaque, so a legal
+  // '>' inside a quoted attribute (e.g. aria-label="if x > 0") does not end it.
+  const source = read.value.replace(/<!--[\s\S]*?-->/g, "");
+  const rootTag = /<svg\b(?:[^>"']|"[^"]*"|'[^']*')*>/i.exec(source);
   if (!rootTag) {
     return { success: true, value: undefined }; // not an SVG root — let sharp report it
   }
