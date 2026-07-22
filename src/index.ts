@@ -287,15 +287,21 @@ export async function handleCallToolRequest(
     // Assertion gate: strictly greater-than trips; equality passes. Applied
     // after the diff artifact exists (file already written / base64 already in
     // content) so a failing CI log keeps the same diagnostics as a passing run.
-    if (
-      typeof max_difference_percentage === "number" &&
-      value.differencePercentage > max_difference_percentage
-    ) {
-      content[0] = {
-        type: "text",
-        text: `Difference ${value.differencePercentage.toFixed(2)}% exceeds max_difference_percentage ${max_difference_percentage}%\n\n${responseText}`,
-      };
-      return { content, isError: true };
+    if (typeof max_difference_percentage === "number") {
+      if (value.totalPixels === 0) {
+        content[0] = {
+          type: "text",
+          text: `Gate failed: no pixels compared (entire image masked); cannot satisfy max_difference_percentage ${max_difference_percentage}%\n\n${responseText}`,
+        };
+        return { content, isError: true };
+      }
+      if (value.differencePercentage > max_difference_percentage) {
+        content[0] = {
+          type: "text",
+          text: `Difference ${value.differencePercentage.toFixed(2)}% exceeds max_difference_percentage ${max_difference_percentage}%\n\n${responseText}`,
+        };
+        return { content, isError: true };
+      }
     }
 
     return { content };
