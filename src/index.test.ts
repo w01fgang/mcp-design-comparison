@@ -830,6 +830,65 @@ describe("MCP request handling", () => {
     await fs.unlink(diff);
   });
 
+  // A non-boolean auto_resize (JSON string "false" is truthy) must fail loud;
+  // silently coercing it would run the opposite mode — resize instead of the
+  // caller's intended strict "require identical dimensions".
+  test("returns error (isError) when auto_resize is a non-boolean string", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: "/non/existent/a.png",
+          implementation_path: "/non/existent/b.png",
+          auto_resize: "false",
+        } as any,
+      },
+    });
+    assert.strictEqual(res.isError, true);
+    assert.match(res.content[0].text, /auto_resize must be a boolean/);
+  });
+
+  test("returns error (isError) when localize is a non-boolean string", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: {
+          design_path: "/non/existent/a.png",
+          implementation_path: "/non/existent/b.png",
+          localize: "no",
+        } as any,
+      },
+    });
+    assert.strictEqual(res.isError, true);
+    assert.match(res.content[0].text, /localize must be a boolean/);
+  });
+
+  // Omitting both booleans applies the defaults (auto_resize=true, localize=true):
+  // mismatched dimensions resize instead of erroring, and localization output appears.
+  test("omitting auto_resize and localize applies the defaults", async () => {
+    const { handleCallToolRequest } = await import("./index.js");
+    const design = path.join(__dirname, "../test-fixtures/h-defaults-design.png");
+    const impl = path.join(__dirname, "../test-fixtures/h-defaults-impl.png");
+    await createTestPNG(10, 10, { r: 255, g: 0, b: 0, a: 255 }, design);
+    await createTestPNG(20, 20, { r: 0, g: 0, b: 255, a: 255 }, impl);
+
+    const res = await handleCallToolRequest({
+      params: {
+        name: "compare_design",
+        arguments: { design_path: design, implementation_path: impl },
+      },
+    });
+    assert.strictEqual(res.isError, undefined);
+    const textItem = res.content.find((c: any) => c.type === "text");
+    assert.ok(textItem.text.includes("auto-resized from 20x20 to 10x10"));
+    assert.ok(textItem.text.includes("Diff bounds:"));
+
+    await fs.unlink(design);
+    await fs.unlink(impl);
+  });
+
   test("returns error (isError) when auto_resize is false and dimensions differ", async () => {
     const { handleCallToolRequest } = await import("./index.js");
     const design = path.join(__dirname, "../test-fixtures/h-noresize-design.png");
