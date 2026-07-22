@@ -484,14 +484,17 @@ export async function compareScreenshots(
 
   let implDensity: number | undefined;
   if (implIsSvg && resizeTo) {
-    // svg_density is a floor/override, not the sole knob: the ceil() term
-    // guarantees the vector render is never smaller than the target.
-    const effectiveDensity = Math.max(
-      density,
-      Math.ceil(
-        72 * Math.max(resizeTo.width / implWidth, resizeTo.height / implHeight)
-      )
-    );
+    // Density need is set by how large the SVG is actually displayed. Under
+    // 'contain' the SVG is letterboxed to the smaller axis scale, so the min
+    // scale sets the crisp-render requirement; 'cover' and 'fill' drive each
+    // axis to the larger scale, so they use the max.
+    const ratioW = resizeTo.width / implWidth;
+    const ratioH = resizeTo.height / implHeight;
+    const scale =
+      resizeTo.fit === "contain"
+        ? Math.min(ratioW, ratioH)
+        : Math.max(ratioW, ratioH);
+    const effectiveDensity = Math.max(density, Math.ceil(72 * scale));
     const cost = checkSvgRenderCost(implWidth, implHeight, effectiveDensity, implementationPath);
     if (!cost.success) {
       return cost;
