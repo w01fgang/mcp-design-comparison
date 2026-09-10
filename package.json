@@ -39,7 +39,7 @@
     "@power-rent/try-catch": "^1.1.0",
     "pixelmatch": "^7.0.0",
     "pngjs": "^7.0.0",
-    "sharp": "^0.33.5",
+    "sharp": "^0.35.4",
     "ssim.js": "^3.5.0"
   },
   "devDependencies": {
